@@ -746,7 +746,7 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .type_name                = "tl2",
         .blck_size                = 1,
         .type_size                = sizeof(int8_t),
-        .is_quantized             = false,
+        .is_quantized             = true,
         .vec_dot                  = (ggml_vec_dot_t) ggml_vec_dot_f32,
         .vec_dot_type             = GGML_TYPE_F32,
         .nrows                    = 1,
@@ -22655,6 +22655,7 @@ size_t ggml_quantize_chunk(
         case GGML_TYPE_TQ2_0:   result = quantize_tq2_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         // each quantize a row, will put a scale in next row first 4B, will diminish by next quantize.
         case GGML_TYPE_I2_S:    result = quantize_i2_s(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_TL2:     result = quantize_i2_s(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_IQ2_XXS: result = quantize_iq2_xxs(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_IQ2_XS:  result = quantize_iq2_xs (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_IQ3_XXS: result = quantize_iq3_xxs(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
@@ -22689,7 +22690,7 @@ size_t ggml_quantize_chunk(
             assert(false);
     }
 
-    if (type == GGML_TYPE_I2_S) {
+    if (type == GGML_TYPE_I2_S || type == GGML_TYPE_TL2) {
         result = nrows * row_size / 4 + 32;
     } else {
         GGML_ASSERT(result == nrows * row_size);

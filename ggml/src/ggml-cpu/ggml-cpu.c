@@ -1490,6 +1490,7 @@ UseGgmlGemm2:;
 
     // I2_S GEMV/GEMM fast path: use optimized SIMD kernels for 2D weight matrices
     if (src0->type == GGML_TYPE_I2_S && ggml_n_dims(src0) == 2) {
+        const bool src1_cont = ggml_is_contiguous(src1);
         const void * src1_wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
         const size_t i2s_row_size = ggml_row_size(vec_dot_type, ne10);
         const size_t src1_col_stride = src1_cont || src1->type != vec_dot_type ? i2s_row_size : nb11;

@@ -12,13 +12,17 @@
 
 #if defined(__AVX2__) || defined(__AVX512F__)
 #include <immintrin.h>
-#define QK_I2_S 128
 #elif defined(__ARM_NEON)
 #include <arm_neon.h>
-#define QK_I2_S 64
-#else
-#define QK_I2_S 128
 #endif
+
+/*
+ * QK_I2_S is the on-disk block size of I2_S weights: 32 packed bytes paired
+ * with 128 activations. It is a property of the file format, not of the host
+ * CPU, so it must be identical on every architecture. Defining it as 64 on
+ * ARM decodes 128-element blocks as 64 and permutes the matmul.
+ */
+#define QK_I2_S 128
 
 #include "gemm-config.h"
 

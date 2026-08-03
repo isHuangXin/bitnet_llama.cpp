@@ -1290,13 +1290,11 @@ void quantize_row_iq4_xs(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, 
 // ====================== BitNet I2_S AVX2 SIMD vec_dot ======================
 // ====================== BitNet I2_S quantization functions ======================
 
-#if defined(__AVX2__) || defined(__AVX512F__)
+/*
+ * On-disk block size of I2_S weights: 32 packed bytes against 128
+ * activations. A file-format constant, identical on every architecture.
+ */
 #define QK_I2_S 128
-#elif defined(__ARM_NEON)
-#define QK_I2_S 64
-#else
-#define QK_I2_S 128
-#endif
 
 #if defined(__AVX2__)
 static inline int hsum_i32_8(const __m256i a) {

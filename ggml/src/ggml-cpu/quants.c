@@ -1290,13 +1290,11 @@ void quantize_row_iq4_xs(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, 
 // ====================== BitNet I2_S AVX2 SIMD vec_dot ======================
 // ====================== BitNet I2_S quantization functions ======================
 
-#if defined(__AVX2__) || defined(__AVX512F__)
+/*
+ * On-disk block size of I2_S weights: 32 packed bytes against 128
+ * activations. A file-format constant, identical on every architecture.
+ */
 #define QK_I2_S 128
-#elif defined(__ARM_NEON)
-#define QK_I2_S 64
-#else
-#define QK_I2_S 128
-#endif
 
 #if defined(__AVX2__)
 static inline int hsum_i32_8(const __m256i a) {
@@ -1486,19 +1484,120 @@ static void ggml_vec_dot_i2_i8_s_1x1(int n, float * s, size_t bs, const void * v
         int sumi = hsum_i32_8(accu);
         s[row] = (float)sumi;
     }
-#else
-    // Scalar fallback
+#elif defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+    /*
+     * NEON path, mirroring the AVX2 kernel above.
+     *
+     * Same block layout: 32 packed weight bytes against 128 activations, with
+     * field f of byte b pairing with activation f*32 + b. AVX2 works on 32
+     * bytes per pass, NEON on 16, so each 32-byte group is two half-passes.
+     *
+     * _mm256_maddubs_epi16 has no direct NEON counterpart (it is unsigned x
+     * signed into 16 bits). vdotq_s32 is used instead: it performs 4-way
+     * 8-bit dot products straight into int32 lanes, which avoids the 16-bit
+     * intermediate entirely. That is safe here because the weight codes are
+     * {0,1,2} and are reinterpreted as signed int8 without change of value.
+     */
     const uint8_t * x = (const uint8_t *)vx;
-    const int8_t * y  = (const int8_t *)vy;
-    static const int map2bit[4] = { -1, 0, 1, 0 };
+    const int8_t  * y = (const int8_t *)vy;
+
+    const uint8x16_t mask = vdupq_n_u8(0x03);
+    const int nblk = n / QK_I2_S;
+    const int nbyte_blk = QK_I2_S / 4;      /* 32 bytes per block */
+
     for (int row = 0; row < nrc; row++) {
-        int32_t sum = 0;
-        for (int i = 0; i < n; i++) {
-            int byte_idx = i / 4;
-            int bit_pos = 6 - 2 * (i % 4);
-            int w = map2bit[(x[row * (n/4) + byte_idx] >> bit_pos) & 0x03];
-            sum += w * y[i];
+        const size_t x_stride = (bx ? (size_t)bx : (size_t)n) / 4;
+        const uint8_t * x_row = x + (size_t)row * x_stride;
+        int32x4_t acc = vdupq_n_s32(0);
+
+        for (int blk = 0; blk < nblk; blk++) {
+            const uint8_t * px = x_row + (size_t)blk * nbyte_blk;
+            const int8_t  * py = y + (size_t)blk * QK_I2_S;
+
+            /* Two 16-byte halves make up the 32-byte weight group. */
+            for (int h = 0; h < 2; h++) {
+                const uint8x16_t xv = vld1q_u8(px + h * 16);
+
+                /* Field f occupies bits 6-2f, matching the AVX2 shifts. */
+                const int8x16_t w0 = vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(xv, 6), mask));
+                const int8x16_t w1 = vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(xv, 4), mask));
+                const int8x16_t w2 = vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(xv, 2), mask));
+                const int8x16_t w3 = vreinterpretq_s8_u8(vandq_u8(xv, mask));
+
+                /* Field f pairs with activations f*32 + (h*16 .. h*16+15). */
+                acc = vdotq_s32(acc, w0, vld1q_s8(py +   0 + h * 16));
+                acc = vdotq_s32(acc, w1, vld1q_s8(py +  32 + h * 16));
+                acc = vdotq_s32(acc, w2, vld1q_s8(py +  64 + h * 16));
+                acc = vdotq_s32(acc, w3, vld1q_s8(py +  96 + h * 16));
+            }
         }
+
+        int32_t sum = vaddvq_s32(acc);
+
+        /* Tail: elements past the last whole block are packed sequentially. */
+        for (int i = nblk * QK_I2_S; i < n; i++) {
+            const int byte_idx = i / 4;
+            const int bit_pos  = 6 - 2 * (i % 4);
+            sum += (int32_t)((x_row[byte_idx] >> bit_pos) & 3) * y[i];
+        }
+
+        s[row] = (float)sum;
+    }
+#else
+    /*
+     * Scalar fallback (everything that is not AVX2, notably ARM).
+     *
+     * The weights are stored block-interleaved, not sequentially: the AVX2
+     * path consumes 32 bytes of weights against 128 activations, extracting
+     * one 2-bit field from every byte per pass. Field f of byte b therefore
+     * belongs to activation f*32 + b within the block.
+     *
+     * Codes are accumulated raw and unsigned ({0,1,2} for {-1,0,+1}), exactly
+     * as _mm256_maddubs_epi16 does: the resulting +1 bias per element is
+     * removed downstream using the precomputed per-row act_sums. Subtracting
+     * it again here would double-correct.
+     *
+     * Decoding sequentially (byte i/4, field i%4) pairs every weight with the
+     * wrong activation and yields a systematically permuted matmul, which
+     * looks like fluent-but-incoherent output rather than an obvious crash.
+     */
+    const uint8_t * x = (const uint8_t *)vx;
+    const int8_t  * y = (const int8_t *)vy;
+
+    const int nblk = n / QK_I2_S;           /* whole 128-element blocks */
+    const int nbyte_blk = QK_I2_S / 4;      /* 32 bytes of weights per block */
+
+    for (int row = 0; row < nrc; row++) {
+        /*
+         * Row stride follows the AVX2 path (bx/4), but callers such as
+         * ggml_gemv_i2_i8_s pass bx=0 with nrc=1; fall back to n/4 so a
+         * single-row call still addresses its row correctly.
+         */
+        const size_t x_stride = (bx ? (size_t)bx : (size_t)n) / 4;
+        const uint8_t * x_row = x + (size_t)row * x_stride;
+        int32_t sum = 0;
+
+        for (int blk = 0; blk < nblk; blk++) {
+            const uint8_t * px = x_row + (size_t)blk * nbyte_blk;
+            const int8_t  * py = y + (size_t)blk * QK_I2_S;
+
+            for (int b = 0; b < nbyte_blk; b++) {
+                const uint8_t v = px[b];
+                /* Field f sits at shift 6-2f and pairs with py[f*32 + b]. */
+                sum += (int32_t)((v >> 6) & 3) * py[b];
+                sum += (int32_t)((v >> 4) & 3) * py[32 + b];
+                sum += (int32_t)((v >> 2) & 3) * py[64 + b];
+                sum += (int32_t)( v       & 3) * py[96 + b];
+            }
+        }
+
+        /* Tail: elements past the last whole block are packed sequentially. */
+        for (int i = nblk * QK_I2_S; i < n; i++) {
+            const int byte_idx = i / 4;
+            const int bit_pos  = 6 - 2 * (i % 4);
+            sum += (int32_t)((x_row[byte_idx] >> bit_pos) & 3) * y[i];
+        }
+
         s[row] = (float)sum;
     }
 #endif

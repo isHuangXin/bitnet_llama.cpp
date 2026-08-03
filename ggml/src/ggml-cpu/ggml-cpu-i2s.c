@@ -12,13 +12,17 @@
 
 #if defined(__AVX2__) || defined(__AVX512F__)
 #include <immintrin.h>
-#define QK_I2_S 128
 #elif defined(__ARM_NEON)
 #include <arm_neon.h>
-#define QK_I2_S 64
-#else
-#define QK_I2_S 128
 #endif
+
+/*
+ * QK_I2_S is the on-disk block size of I2_S weights: 32 packed bytes paired
+ * with 128 activations. It is a property of the file format, not of the host
+ * CPU, so it must be identical on every architecture. Defining it as 64 on
+ * ARM decodes 128-element blocks as 64 and permutes the matmul.
+ */
+#define QK_I2_S 128
 
 #include "gemm-config.h"
 
@@ -194,11 +198,29 @@ void ggml_gemm_i2_i8_s(int n, float * GGML_RESTRICT s, size_t bs, const void * G
                 const int64_t col = c0 + c;
                 float * s_col = s + col;
                 const void * vx_col = (const uint8_t *)vx + col * n / 4;
-                ggml_vec_dot_i2_i8_s(n, s_col + r0 * bs, bs, vx_col, n, vy_r, n, cur_r);
+                /*
+                 * vec_dot's nrc loop walks WEIGHT rows against a fixed
+                 * activation vector, and writes its results contiguously.
+                 * Here the weight row is fixed and we need one result per
+                 * activation column, so call it once per column with nrc=1
+                 * and place the result ourselves at the bs-strided slot.
+                 */
+                for (int64_t r = 0; r < cur_r; ++r) {
+                    const void * vy_cur = (const uint8_t *)vy_r + r * n;
+                    ggml_vec_dot_i2_i8_s(n, s_col + (r0 + r) * bs, 1,
+                                         vx_col, n, vy_cur, n, 1);
+                }
             }
         }
     }
 #else
+    /*
+     * ggml_vec_dot_i2_i8_s writes its nrc results contiguously (s[0..nrc-1])
+     * and ignores the bs argument, so results for one activation column land
+     * packed. That matches the output layout here -- consecutive weight rows
+     * for a fixed column are adjacent -- as long as the destination pointer
+     * is the start of that column's run.
+     */
     for (int64_t r0 = 0; r0 < nr; r0 += row_block) {
         int64_t cur_r = (r0 + row_block <= nr) ? row_block : (nr - r0);
         const void * vy_row = (const uint8_t *)vy + r0 * n;

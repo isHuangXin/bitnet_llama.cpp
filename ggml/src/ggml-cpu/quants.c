@@ -1484,6 +1484,65 @@ static void ggml_vec_dot_i2_i8_s_1x1(int n, float * s, size_t bs, const void * v
         int sumi = hsum_i32_8(accu);
         s[row] = (float)sumi;
     }
+#elif defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+    /*
+     * NEON path, mirroring the AVX2 kernel above.
+     *
+     * Same block layout: 32 packed weight bytes against 128 activations, with
+     * field f of byte b pairing with activation f*32 + b. AVX2 works on 32
+     * bytes per pass, NEON on 16, so each 32-byte group is two half-passes.
+     *
+     * _mm256_maddubs_epi16 has no direct NEON counterpart (it is unsigned x
+     * signed into 16 bits). vdotq_s32 is used instead: it performs 4-way
+     * 8-bit dot products straight into int32 lanes, which avoids the 16-bit
+     * intermediate entirely. That is safe here because the weight codes are
+     * {0,1,2} and are reinterpreted as signed int8 without change of value.
+     */
+    const uint8_t * x = (const uint8_t *)vx;
+    const int8_t  * y = (const int8_t *)vy;
+
+    const uint8x16_t mask = vdupq_n_u8(0x03);
+    const int nblk = n / QK_I2_S;
+    const int nbyte_blk = QK_I2_S / 4;      /* 32 bytes per block */
+
+    for (int row = 0; row < nrc; row++) {
+        const size_t x_stride = (bx ? (size_t)bx : (size_t)n) / 4;
+        const uint8_t * x_row = x + (size_t)row * x_stride;
+        int32x4_t acc = vdupq_n_s32(0);
+
+        for (int blk = 0; blk < nblk; blk++) {
+            const uint8_t * px = x_row + (size_t)blk * nbyte_blk;
+            const int8_t  * py = y + (size_t)blk * QK_I2_S;
+
+            /* Two 16-byte halves make up the 32-byte weight group. */
+            for (int h = 0; h < 2; h++) {
+                const uint8x16_t xv = vld1q_u8(px + h * 16);
+
+                /* Field f occupies bits 6-2f, matching the AVX2 shifts. */
+                const int8x16_t w0 = vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(xv, 6), mask));
+                const int8x16_t w1 = vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(xv, 4), mask));
+                const int8x16_t w2 = vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(xv, 2), mask));
+                const int8x16_t w3 = vreinterpretq_s8_u8(vandq_u8(xv, mask));
+
+                /* Field f pairs with activations f*32 + (h*16 .. h*16+15). */
+                acc = vdotq_s32(acc, w0, vld1q_s8(py +   0 + h * 16));
+                acc = vdotq_s32(acc, w1, vld1q_s8(py +  32 + h * 16));
+                acc = vdotq_s32(acc, w2, vld1q_s8(py +  64 + h * 16));
+                acc = vdotq_s32(acc, w3, vld1q_s8(py +  96 + h * 16));
+            }
+        }
+
+        int32_t sum = vaddvq_s32(acc);
+
+        /* Tail: elements past the last whole block are packed sequentially. */
+        for (int i = nblk * QK_I2_S; i < n; i++) {
+            const int byte_idx = i / 4;
+            const int bit_pos  = 6 - 2 * (i % 4);
+            sum += (int32_t)((x_row[byte_idx] >> bit_pos) & 3) * y[i];
+        }
+
+        s[row] = (float)sum;
+    }
 #else
     /*
      * Scalar fallback (everything that is not AVX2, notably ARM).

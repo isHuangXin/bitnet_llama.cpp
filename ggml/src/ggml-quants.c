@@ -5578,6 +5578,9 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_I16:
         case GGML_TYPE_I32:
         case GGML_TYPE_I64:
+        // BitNet ternary weights are packed integer codes with a separate
+        // float scale, so there are no float lanes here to check for inf/nan.
+        case GGML_TYPE_I2_S:
             // nothing to validate
             break;
         default:

@@ -1485,18 +1485,60 @@ static void ggml_vec_dot_i2_i8_s_1x1(int n, float * s, size_t bs, const void * v
         s[row] = (float)sumi;
     }
 #else
-    // Scalar fallback
+    /*
+     * Scalar fallback (everything that is not AVX2, notably ARM).
+     *
+     * The weights are stored block-interleaved, not sequentially: the AVX2
+     * path consumes 32 bytes of weights against 128 activations, extracting
+     * one 2-bit field from every byte per pass. Field f of byte b therefore
+     * belongs to activation f*32 + b within the block.
+     *
+     * Codes are accumulated raw and unsigned ({0,1,2} for {-1,0,+1}), exactly
+     * as _mm256_maddubs_epi16 does: the resulting +1 bias per element is
+     * removed downstream using the precomputed per-row act_sums. Subtracting
+     * it again here would double-correct.
+     *
+     * Decoding sequentially (byte i/4, field i%4) pairs every weight with the
+     * wrong activation and yields a systematically permuted matmul, which
+     * looks like fluent-but-incoherent output rather than an obvious crash.
+     */
     const uint8_t * x = (const uint8_t *)vx;
-    const int8_t * y  = (const int8_t *)vy;
-    static const int map2bit[4] = { -1, 0, 1, 0 };
+    const int8_t  * y = (const int8_t *)vy;
+
+    const int nblk = n / QK_I2_S;           /* whole 128-element blocks */
+    const int nbyte_blk = QK_I2_S / 4;      /* 32 bytes of weights per block */
+
     for (int row = 0; row < nrc; row++) {
+        /*
+         * Row stride follows the AVX2 path (bx/4), but callers such as
+         * ggml_gemv_i2_i8_s pass bx=0 with nrc=1; fall back to n/4 so a
+         * single-row call still addresses its row correctly.
+         */
+        const size_t x_stride = (bx ? (size_t)bx : (size_t)n) / 4;
+        const uint8_t * x_row = x + (size_t)row * x_stride;
         int32_t sum = 0;
-        for (int i = 0; i < n; i++) {
-            int byte_idx = i / 4;
-            int bit_pos = 6 - 2 * (i % 4);
-            int w = map2bit[(x[row * (n/4) + byte_idx] >> bit_pos) & 0x03];
-            sum += w * y[i];
+
+        for (int blk = 0; blk < nblk; blk++) {
+            const uint8_t * px = x_row + (size_t)blk * nbyte_blk;
+            const int8_t  * py = y + (size_t)blk * QK_I2_S;
+
+            for (int b = 0; b < nbyte_blk; b++) {
+                const uint8_t v = px[b];
+                /* Field f sits at shift 6-2f and pairs with py[f*32 + b]. */
+                sum += (int32_t)((v >> 6) & 3) * py[b];
+                sum += (int32_t)((v >> 4) & 3) * py[32 + b];
+                sum += (int32_t)((v >> 2) & 3) * py[64 + b];
+                sum += (int32_t)( v       & 3) * py[96 + b];
+            }
         }
+
+        /* Tail: elements past the last whole block are packed sequentially. */
+        for (int i = nblk * QK_I2_S; i < n; i++) {
+            const int byte_idx = i / 4;
+            const int bit_pos  = 6 - 2 * (i % 4);
+            sum += (int32_t)((x_row[byte_idx] >> bit_pos) & 3) * y[i];
+        }
+
         s[row] = (float)sum;
     }
 #endif

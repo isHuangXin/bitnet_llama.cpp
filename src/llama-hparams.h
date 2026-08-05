@@ -112,6 +112,7 @@ struct llama_hparams {
 
     // for RWKV
     uint32_t rescale_every_n_layers = 0;
+    uint32_t yoco_u_iters           = 1; // YOCO-U: number of self-decoder iterations (T), default 1 = no recursion
     uint32_t time_mix_extra_dim     = 0;
     uint32_t time_decay_extra_dim   = 0;
     uint32_t wkv_head_size          = 0;

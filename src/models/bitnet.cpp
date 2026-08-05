@@ -21,16 +21,21 @@ void llama_model_bitnet::load_arch_tensors(llama_model_loader &) {
     for (int i = 0; i < n_layer; ++i) {
         auto & layer = layers[i];
 
-        layer.attn_norm     = create_tensor(tn(LLM_TENSOR_ATTN_NORM,     "weight", i), {n_embd}, 0);
-        layer.attn_sub_norm = create_tensor(tn(LLM_TENSOR_ATTN_SUB_NORM, "weight", i), {n_embd}, 0);
+        const int64_t n_head_i    = hparams.n_head(i);
+        const int64_t n_head_kv_i = hparams.n_head_kv(i);
+        const int64_t q_dim_i     = n_head_i * n_embd_head_k;
+        const int64_t kv_dim_i    = n_head_kv_i * n_embd_head_k;
 
-        layer.wq       = create_tensor(tn(LLM_TENSOR_ATTN_Q,   "weight", i), {n_embd, n_embd}, 0);
+        layer.attn_norm     = create_tensor(tn(LLM_TENSOR_ATTN_NORM,     "weight", i), {n_embd}, 0);
+        layer.attn_sub_norm = create_tensor(tn(LLM_TENSOR_ATTN_SUB_NORM, "weight", i), {q_dim_i}, 0);
+
+        layer.wq       = create_tensor(tn(LLM_TENSOR_ATTN_Q,   "weight", i), {n_embd, q_dim_i}, 0);
         layer.wq_s     = create_tensor(tn(LLM_TENSOR_ATTN_Q,   "scale",  i), {1}, TENSOR_NOT_REQUIRED);
-        layer.wk       = create_tensor(tn(LLM_TENSOR_ATTN_K,   "weight", i), {n_embd, n_embd_gqa}, 0);
+        layer.wk       = create_tensor(tn(LLM_TENSOR_ATTN_K,   "weight", i), {n_embd, kv_dim_i}, 0);
         layer.wk_s     = create_tensor(tn(LLM_TENSOR_ATTN_K,   "scale",  i), {1}, TENSOR_NOT_REQUIRED);
-        layer.wv       = create_tensor(tn(LLM_TENSOR_ATTN_V,   "weight", i), {n_embd, n_embd_gqa}, 0);
+        layer.wv       = create_tensor(tn(LLM_TENSOR_ATTN_V,   "weight", i), {n_embd, kv_dim_i}, 0);
         layer.wv_s     = create_tensor(tn(LLM_TENSOR_ATTN_V,   "scale",  i), {1}, TENSOR_NOT_REQUIRED);
-        layer.wo       = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd, n_embd}, 0);
+        layer.wo       = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {q_dim_i, n_embd}, 0);
         layer.wo_s     = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "scale",  i), {1}, TENSOR_NOT_REQUIRED);
 
         layer.ffn_norm     = create_tensor(tn(LLM_TENSOR_FFN_NORM,     "weight", i), {n_embd}, 0);
@@ -43,6 +48,12 @@ void llama_model_bitnet::load_arch_tensors(llama_model_loader &) {
         layer.ffn_up         = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd, n_ff}, 0);
         layer.ffn_up_s   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "scale",  i), {1}, TENSOR_NOT_REQUIRED);
     }
+
+    // YOCO shared cross KV tensors (model-level, optional)
+    const int64_t kv_dim = hparams.n_head_kv() * n_embd_head_k;
+    yoco_cross_kv_norm = create_tensor(tn(LLM_TENSOR_YOCO_CROSS_KV_NORM, "weight"), {n_embd}, TENSOR_NOT_REQUIRED);
+    yoco_cross_k       = create_tensor(tn(LLM_TENSOR_YOCO_CROSS_K,       "weight"), {n_embd, kv_dim}, TENSOR_NOT_REQUIRED);
+    yoco_cross_v       = create_tensor(tn(LLM_TENSOR_YOCO_CROSS_V,       "weight"), {n_embd, kv_dim}, TENSOR_NOT_REQUIRED);
 }
 
 std::unique_ptr<llm_graph_context> llama_model_bitnet::build_arch_graph(const llm_graph_params & params) const {
@@ -69,6 +80,9 @@ llama_model_bitnet::graph::graph(const llama_model & model, const llm_graph_para
     for (int il = 0; il < n_layer; ++il) {
         ggml_tensor * inpSA = inpL;
 
+        const int64_t n_head_il    = hparams.n_head(il);
+        const int64_t n_head_kv_il = hparams.n_head_kv(il);
+
         cur = build_norm(inpL,
                 model.layers[il].attn_norm, NULL,
                 LLM_NORM_RMS, il);
@@ -77,7 +91,7 @@ llama_model_bitnet::graph::graph(const llama_model & model, const llm_graph_para
         // self-attention
         {
             auto [Qcur, Kcur, Vcur] = build_qkv(model.layers[il], cur,
-                    n_embd_head, n_head, n_head_kv, il);
+                    n_embd_head, n_head_il, n_head_kv_il, il);
 
             Qcur = ggml_rope_ext(
                     ctx0, Qcur, inp_pos, nullptr,

@@ -574,6 +574,11 @@ struct llama_model {
     struct ggml_tensor * output_b        = nullptr;
     struct ggml_tensor * output_norm_enc = nullptr;
 
+    // YOCO shared cross KV tensors (model-level, not per-layer)
+    struct ggml_tensor * yoco_cross_kv_norm = nullptr;
+    struct ggml_tensor * yoco_cross_k       = nullptr;
+    struct ggml_tensor * yoco_cross_v       = nullptr;
+
 
     // NVFP4 per-tensor scale2, input_scale for LM head
     struct ggml_tensor * output_s    = nullptr;

@@ -6,6 +6,27 @@ void llama_model_bitnet::load_arch_hparams(llama_model_loader & ml) {
     // YOCO-U: read self-decoder iteration count (T), default 1
     ml.get_key(LLM_KV_YOCO_U_ITERS, hparams.yoco_u_iters, false);
 
+    if (hparams.yoco_u_iters > 1) {
+        // YOCO-U: self-decoder layers use SWA via sliding_window parameter
+        // Cross-decoder layers use shared global KV (no per-layer cache)
+        ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW, hparams.n_swa, false);
+        if (hparams.n_swa == 0) {
+            hparams.n_swa = 512;
+        }
+
+        const uint32_t n_layer_total = hparams.n_layer();
+        const uint32_t n_cross = n_layer_total / (hparams.yoco_u_iters + 1);
+        const uint32_t n_self_unrolled = n_cross * hparams.yoco_u_iters;
+
+        // Only self-decoder layers (0-20) get KV cache
+        // Cross-decoder layers (21-27) use no-cache shared KV attention
+        hparams.n_layer_kv_from_start = (int32_t)n_self_unrolled;
+
+        // Note: swa_type remains NONE — we use regular KV cache with sliding_window
+        // The sliding_window parameter applies window-based masking to all KV cache layers
+        // This is functionally equivalent to SWA for self-decoder layers
+    }
+
     switch (hparams.n_layer()) {
         case 14: type = LLM_TYPE_1_5B; break;
         case 26: type = LLM_TYPE_3B; break;

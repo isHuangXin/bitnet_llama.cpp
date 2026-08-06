@@ -3,6 +3,9 @@
 void llama_model_bitnet::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
 
+    // YOCO-U: read self-decoder iteration count (T), default 1
+    ml.get_key(LLM_KV_YOCO_U_ITERS, hparams.yoco_u_iters, false);
+
     switch (hparams.n_layer()) {
         case 14: type = LLM_TYPE_1_5B; break;
         case 26: type = LLM_TYPE_3B; break;
@@ -67,6 +70,13 @@ llama_model_bitnet::graph::graph(const llama_model & model, const llm_graph_para
 
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
 
+    const uint32_t yoco_u_iters = hparams.yoco_u_iters;
+    const bool is_yoco_u = (yoco_u_iters > 1);
+
+    // For YOCO-U: determine self/cross boundary
+    const int n_cross = is_yoco_u ? (n_layer / (yoco_u_iters + 1)) : 0;           // 7
+    const int n_self_unrolled = is_yoco_u ? (n_cross * (int)yoco_u_iters) : n_layer; // 21
+
     ggml_tensor * cur;
     ggml_tensor * inpL;
 
@@ -77,7 +87,14 @@ llama_model_bitnet::graph::graph(const llama_model & model, const llm_graph_para
 
     auto * inp_attn = build_attn_inp_kv();
 
+    // For YOCO-U cross-decoder: no-cache attention
+    auto * inp_attn_nc = is_yoco_u ? build_attn_inp_no_cache() : nullptr;
+
     ggml_tensor * inp_out_ids = build_inp_out_ids();
+
+    // Shared KV for cross-decoder (computed after self-decoder finishes)
+    ggml_tensor * shared_K = nullptr;
+    ggml_tensor * shared_V = nullptr;
 
     for (int il = 0; il < n_layer; ++il) {
         ggml_tensor * inpSA = inpL;
@@ -85,35 +102,61 @@ llama_model_bitnet::graph::graph(const llama_model & model, const llm_graph_para
         const int64_t n_head_il    = hparams.n_head(il);
         const int64_t n_head_kv_il = hparams.n_head_kv(il);
 
+        const bool is_cross_layer = is_yoco_u && (il >= n_self_unrolled);
+
         cur = build_norm(inpL,
                 model.layers[il].attn_norm, NULL,
                 LLM_NORM_RMS, il);
         cb(cur, "attn_norm", il);
 
-        // self-attention
+        // attention
         {
-            auto [Qcur, Kcur, Vcur] = build_qkv(model.layers[il], cur,
-                    n_embd_head, n_head_il, n_head_kv_il, il);
+            if (!is_cross_layer) {
+                // ===== Self-Decoder: normal per-layer KV cache attention =====
+                auto [Qcur, Kcur, Vcur] = build_qkv(model.layers[il], cur,
+                        n_embd_head, n_head_il, n_head_kv_il, il);
 
-            Qcur = ggml_rope_ext(
-                    ctx0, Qcur, inp_pos, nullptr,
-                    n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
-                    ext_factor, attn_factor, beta_fast, beta_slow
-                    );
+                Qcur = ggml_rope_ext(
+                        ctx0, Qcur, inp_pos, nullptr,
+                        n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
+                        ext_factor, attn_factor, beta_fast, beta_slow
+                        );
 
-            Kcur = ggml_rope_ext(
-                    ctx0, Kcur, inp_pos, nullptr,
-                    n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
-                    ext_factor, attn_factor, beta_fast, beta_slow
-                    );
+                Kcur = ggml_rope_ext(
+                        ctx0, Kcur, inp_pos, nullptr,
+                        n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
+                        ext_factor, attn_factor, beta_fast, beta_slow
+                        );
 
-            cb(Qcur, "Qcur", il);
-            cb(Kcur, "Kcur", il);
-            cb(Vcur, "Vcur", il);
+                cb(Qcur, "Qcur", il);
+                cb(Kcur, "Kcur", il);
+                cb(Vcur, "Vcur", il);
 
-            cur = build_attn(inp_attn,
-                    NULL, NULL, NULL,
-                    Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, 1.0f/sqrtf(float(n_embd_head)), il);
+                cur = build_attn(inp_attn,
+                        NULL, NULL, NULL,
+                        Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, 1.0f/sqrtf(float(n_embd_head)), il);
+            } else {
+                // ===== Cross-Decoder: only compute Q, reuse shared K/V =====
+                GGML_ASSERT(shared_K != nullptr && shared_V != nullptr);
+
+                // Compute Q only
+                ggml_tensor * Qcur = build_lora_mm(model.layers[il].wq, cur, model.layers[il].wq_s);
+                cb(Qcur, "Qcur_pre", il);
+                Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head_il, n_tokens);
+
+                Qcur = ggml_rope_ext(
+                        ctx0, Qcur, inp_pos, nullptr,
+                        n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
+                        ext_factor, attn_factor, beta_fast, beta_slow
+                        );
+
+                cb(Qcur, "Qcur", il);
+
+                // Use no-cache attention with shared K/V
+                cur = build_attn(inp_attn_nc,
+                        NULL, NULL, NULL,
+                        Qcur, shared_K, shared_V, nullptr, nullptr, nullptr, 1.0f/sqrtf(float(n_embd_head)), il);
+            }
 
             cur = build_norm(cur,
                     model.layers[il].attn_sub_norm, NULL,
@@ -165,6 +208,31 @@ llama_model_bitnet::graph::graph(const llama_model & model, const llm_graph_para
 
         // input for next layer
         inpL = cur;
+
+        // YOCO-U: compute shared global KV after self-decoder finishes
+        if (is_yoco_u && il == n_self_unrolled - 1 && model.yoco_cross_kv_norm) {
+            const int64_t n_head_kv_cross = hparams.n_head_kv(n_self_unrolled); // kv heads for cross layers
+
+            // K̂ = LN(self_decoder_output) × W_K_shared
+            ggml_tensor * shared_kv_normed = build_norm(inpL,
+                    model.yoco_cross_kv_norm, NULL,
+                    LLM_NORM_RMS, -1);
+            cb(shared_kv_normed, "yoco_cross_kv_norm", -1);
+
+            shared_K = build_lora_mm(model.yoco_cross_k, shared_kv_normed);
+            shared_K = ggml_reshape_3d(ctx0, shared_K, n_embd_head, n_head_kv_cross, n_tokens);
+            shared_K = ggml_rope_ext(
+                    ctx0, shared_K, inp_pos, nullptr,
+                    n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
+                    ext_factor, attn_factor, beta_fast, beta_slow
+                    );
+            cb(shared_K, "yoco_shared_K", -1);
+
+            // V̂ = LN(self_decoder_output) × W_V_shared
+            shared_V = build_lora_mm(model.yoco_cross_v, shared_kv_normed);
+            shared_V = ggml_reshape_3d(ctx0, shared_V, n_embd_head, n_head_kv_cross, n_tokens);
+            cb(shared_V, "yoco_shared_V", -1);
+        }
     }
 
     cur = inpL;

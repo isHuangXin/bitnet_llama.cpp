@@ -21,11 +21,12 @@ static void timestep_embedding_f32(
     int j = item_ct1.get_local_id(2) + item_ct1.get_group(2) * item_ct1.get_local_range(2);
     float * embed_data = (float *)((char *)dst +  i*nb1);
 
-    if (dim % 2 != 0 && j == ((dim + 1) / 2)) {
-        embed_data[dim] = 0.f;
+    int half = dim / 2;
+
+    if (dim % 2 != 0 && j == half) {
+        embed_data[2 * half] = 0.f;
     }
 
-    int half = dim / 2;
     if (j >= half) {
         return;
     }
@@ -55,8 +56,9 @@ static void timestep_embedding_f32_sycl(
         });
 }
 
-void ggml_sycl_op_timestep_embedding(ggml_backend_sycl_context & ctx, const ggml_tensor *src0,
-    const ggml_tensor *src1, ggml_tensor * dst) {
+void ggml_sycl_op_timestep_embedding(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
+    scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/1);
+    const ggml_tensor *  src0   = dst->src[0];
     const float * src0_d = (const float *)src0->data;
     float * dst_d = (float *)dst->data;
     dpct::queue_ptr stream = ctx.stream();

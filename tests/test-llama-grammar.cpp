@@ -2,16 +2,16 @@
 #undef NDEBUG
 #endif
 
-#define LLAMA_API_INTERNAL
 #include "llama.h"
-#include "grammar-parser.h"
+
+#include "../src/llama-grammar.h"
 
 #include <cassert>
 #include <stdexcept>
 
 int main()
 {
-    grammar_parser::parse_state parsed_grammar;
+    llama_grammar_parser parsed_grammar;
 
     std::vector<std::pair<std::string, uint32_t>> expected = {
         {"expr", 2},
@@ -114,18 +114,32 @@ int main()
         }
     }
 
-    llama_grammar * grammar = NULL;
     std::vector<const llama_grammar_element *> grammar_rules(parsed_grammar.c_rules());
 
-    grammar = llama_grammar_init(grammar_rules.data(), grammar_rules.size(), parsed_grammar.symbol_ids.at("root"));
-    if (grammar == nullptr)
-    {
+    llama_grammar * grammar = llama_grammar_init_impl(nullptr, grammar_rules.data(), grammar_rules.size(), parsed_grammar.symbol_ids.at("root"));
+    if (grammar == nullptr) {
         throw std::runtime_error("Failed to initialize llama_grammar");
     }
 
     std::vector<std::vector<llama_grammar_element>> expected_stacks = {
         {
-            {LLAMA_GRETYPE_RULE_REF, 5},
+            {LLAMA_GRETYPE_CHAR, 61},
+            {LLAMA_GRETYPE_RULE_REF, 7},
+            {LLAMA_GRETYPE_CHAR, 40},
+        },
+        {
+            {LLAMA_GRETYPE_CHAR, 61},
+            {LLAMA_GRETYPE_RULE_REF, 7},
+            {LLAMA_GRETYPE_RULE_REF, 3},
+            {LLAMA_GRETYPE_CHAR, 48},
+        },
+        {
+            {LLAMA_GRETYPE_CHAR, 61},
+            {LLAMA_GRETYPE_RULE_REF, 7},
+            {LLAMA_GRETYPE_RULE_REF, 3},
+            {LLAMA_GRETYPE_CHAR, 48},
+        },
+        {
             {LLAMA_GRETYPE_CHAR, 61},
             {LLAMA_GRETYPE_RULE_REF, 7},
             {LLAMA_GRETYPE_CHAR, 97},
@@ -134,53 +148,37 @@ int main()
             {LLAMA_GRETYPE_RULE_REF, 5},
             {LLAMA_GRETYPE_CHAR, 61},
             {LLAMA_GRETYPE_RULE_REF, 7},
-            {LLAMA_GRETYPE_RULE_REF, 3},
-            {LLAMA_GRETYPE_CHAR, 48},
-        },
-        {
-            {LLAMA_GRETYPE_RULE_REF, 5},
-            {LLAMA_GRETYPE_CHAR, 61},
-            {LLAMA_GRETYPE_RULE_REF, 7},
-            {LLAMA_GRETYPE_RULE_REF, 3},
-            {LLAMA_GRETYPE_CHAR, 48},
-        },
-        {
-            {LLAMA_GRETYPE_RULE_REF, 5},
-            {LLAMA_GRETYPE_CHAR, 61},
-            {LLAMA_GRETYPE_RULE_REF, 7},
             {LLAMA_GRETYPE_CHAR, 40},
         },
         {
+            {LLAMA_GRETYPE_RULE_REF, 5},
+            {LLAMA_GRETYPE_CHAR, 61},
+            {LLAMA_GRETYPE_RULE_REF, 7},
+            {LLAMA_GRETYPE_RULE_REF, 3},
+            {LLAMA_GRETYPE_CHAR, 48},
+        },
+        {
+            {LLAMA_GRETYPE_RULE_REF, 5},
+            {LLAMA_GRETYPE_CHAR, 61},
+            {LLAMA_GRETYPE_RULE_REF, 7},
+            {LLAMA_GRETYPE_RULE_REF, 3},
+            {LLAMA_GRETYPE_CHAR, 48},
+        },
+        {
+            {LLAMA_GRETYPE_RULE_REF, 5},
             {LLAMA_GRETYPE_CHAR, 61},
             {LLAMA_GRETYPE_RULE_REF, 7},
             {LLAMA_GRETYPE_CHAR, 97},
-        },
-        {
-            {LLAMA_GRETYPE_CHAR, 61},
-            {LLAMA_GRETYPE_RULE_REF, 7},
-            {LLAMA_GRETYPE_RULE_REF, 3},
-            {LLAMA_GRETYPE_CHAR, 48},
-        },
-        {
-            {LLAMA_GRETYPE_CHAR, 61},
-            {LLAMA_GRETYPE_RULE_REF, 7},
-            {LLAMA_GRETYPE_RULE_REF, 3},
-            {LLAMA_GRETYPE_CHAR, 48},
-        },
-        {
-            {LLAMA_GRETYPE_CHAR, 61},
-            {LLAMA_GRETYPE_RULE_REF, 7},
-            {LLAMA_GRETYPE_CHAR, 40},
         }};
 
     auto index = 0;
-    for (auto stack : llama_grammar_get_stacks(grammar))
+    for (const llama_grammar_stack & stack : llama_grammar_get_stacks(grammar))
     {
         // compare stack to expected_stack
         for (uint32_t i = 0; i < stack.size(); i++)
         {
-            auto element = stack[i];
-            auto expected_element = expected_stacks[index][i];
+            const llama_grammar_element * element = stack[i];
+            const llama_grammar_element & expected_element = expected_stacks[index][i];
 
             // pretty print error message before asserting
             if (expected_element.type != element->type || expected_element.value != element->value)
@@ -197,14 +195,14 @@ int main()
     }
 
     std::vector<llama_grammar_candidate> next_candidates;
-    next_candidates.resize(24);
+    next_candidates.resize(23);
 
-    for (size_t i = 0; i < 24; ++i)
+    for (size_t i = 0; i < 23; ++i)
     {
         uint32_t *cp = new uint32_t[2]; // dynamically allocate memory for code_point
         cp[0] = 37 + i;
         cp[1] = 0;
-        next_candidates[i] = {i, cp, {}};
+        next_candidates[i] = {i, cp, {}, 0};
     }
 
     std::vector<std::vector<std::pair<uint32_t, uint16_t>>> expected_reject = {
@@ -212,7 +210,6 @@ int main()
             {0, 37},
             {1, 38},
             {2, 39},
-            {3, 40},
             {4, 41},
             {5, 42},
             {6, 43},
@@ -270,6 +267,31 @@ int main()
             {0, 37},
             {1, 38},
             {2, 39},
+            {3, 40},
+            {4, 41},
+            {5, 42},
+            {6, 43},
+            {7, 44},
+            {8, 45},
+            {9, 46},
+            {10, 47},
+            {11, 48},
+            {12, 49},
+            {13, 50},
+            {14, 51},
+            {15, 52},
+            {16, 53},
+            {17, 54},
+            {18, 55},
+            {19, 56},
+            {20, 57},
+            {21, 58},
+            {22, 59},
+        },
+        {
+            {0, 37},
+            {1, 38},
+            {2, 39},
             {4, 41},
             {5, 42},
             {6, 43},
@@ -303,16 +325,6 @@ int main()
             {8, 45},
             {9, 46},
             {10, 47},
-            {11, 48},
-            {12, 49},
-            {13, 50},
-            {14, 51},
-            {15, 52},
-            {16, 53},
-            {17, 54},
-            {18, 55},
-            {19, 56},
-            {20, 57},
             {21, 58},
             {22, 59},
             {23, 60},
@@ -345,21 +357,6 @@ int main()
             {8, 45},
             {9, 46},
             {10, 47},
-            {21, 58},
-            {22, 59},
-            {23, 60},
-        },
-        {
-            {0, 37},
-            {1, 38},
-            {2, 39},
-            {4, 41},
-            {5, 42},
-            {6, 43},
-            {7, 44},
-            {8, 45},
-            {9, 46},
-            {10, 47},
             {11, 48},
             {12, 49},
             {13, 50},
@@ -372,7 +369,6 @@ int main()
             {20, 57},
             {21, 58},
             {22, 59},
-            {23, 60},
         },
     };
 
@@ -403,6 +399,8 @@ int main()
         delete[] candidate.code_points;
         candidate.code_points = nullptr;
     }
-    llama_grammar_free(grammar);
+
+    llama_grammar_free_impl(grammar);
+
     return 0;
 }

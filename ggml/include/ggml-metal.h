@@ -1,3 +1,5 @@
+// Note: this description is outdated
+//
 // An interface allowing to compute ggml_cgraph with Metal
 //
 // This is a fully functional interface that extends ggml with GPU support for Apple devices.
@@ -25,9 +27,6 @@
 #include <stddef.h>
 #include <stdbool.h>
 
-// max memory buffers that can be mapped to the device
-#define GGML_METAL_MAX_BUFFERS 64
-
 struct ggml_tensor;
 struct ggml_cgraph;
 
@@ -40,27 +39,22 @@ extern "C" {
 // user-code should use only these functions
 //
 
-GGML_API void ggml_backend_metal_log_set_callback(ggml_log_callback log_callback, void * user_data);
+// TODO: remove in the future
+GGML_BACKEND_API ggml_backend_t ggml_backend_metal_init(void);
 
-GGML_API ggml_backend_t ggml_backend_metal_init(void);
+GGML_BACKEND_API bool ggml_backend_is_metal(ggml_backend_t backend);
 
-GGML_API bool ggml_backend_is_metal(ggml_backend_t backend);
-
-GGML_API GGML_CALL ggml_backend_buffer_t ggml_backend_metal_buffer_from_ptr(void * data, size_t size, size_t max_size);
-
-GGML_API void ggml_backend_metal_set_n_cb(ggml_backend_t backend, int n_cb);
-
-GGML_API void ggml_backend_metal_set_abort_callback(ggml_backend_t backend, ggml_abort_callback abort_callback, void * user_data);
-
-GGML_API GGML_CALL ggml_backend_buffer_type_t ggml_backend_metal_buffer_type(void);
+GGML_BACKEND_API void ggml_backend_metal_set_abort_callback(ggml_backend_t backend, ggml_abort_callback abort_callback, void * user_data);
 
 // helper to check if the device supports a specific family
 // ideally, the user code should be doing these checks
 // ref: https://developer.apple.com/metal/Metal-Feature-Set-Tables.pdf
-GGML_API bool ggml_backend_metal_supports_family(ggml_backend_t backend, int family);
+GGML_BACKEND_API bool ggml_backend_metal_supports_family(ggml_backend_t backend, int family);
 
 // capture all command buffers committed the next time `ggml_backend_graph_compute` is called
-GGML_API void ggml_backend_metal_capture_next_compute(ggml_backend_t backend);
+GGML_BACKEND_API void ggml_backend_metal_capture_next_compute(ggml_backend_t backend);
+
+GGML_BACKEND_API ggml_backend_reg_t ggml_backend_metal_reg(void);
 
 #ifdef __cplusplus
 }

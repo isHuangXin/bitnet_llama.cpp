@@ -1,11 +1,12 @@
 {
-  "extraPaths": ["gguf-py"],
+  "extraPaths": ["gguf-py", "examples/model-conversion/scripts", "examples/model-conversion/scripts/utils"],
   "pythonVersion": "3.9",
   "pythonPlatform": "All",
   "reportUnusedImport": "warning",
   "reportDuplicateImport": "error",
   "reportDeprecated": "warning",
-  "reportUnnecessaryTypeIgnoreComment": "warning",
+  "reportUnnecessaryTypeIgnoreComment": "information",
+  "disableBytesTypePromotions": false, // TODO: change once Python 3.12 is the minimum
   "executionEnvironments": [
     {
       // TODO: make this version override work correctly
@@ -14,7 +15,7 @@
     },
     {
       // uses match expressions in steps.py
-      "root": "examples/server/tests",
+      "root": "tools/server/tests",
       "pythonVersion": "3.10",
     },
   ],

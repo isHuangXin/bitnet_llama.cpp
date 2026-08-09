@@ -858,8 +858,9 @@ static const std::map<std::string, llm_ffn_op_type> LLM_FFN_OP_TYPES_FROM_STRING
     { "silu",   LLM_FFN_SWIGLU },
     { "swish",  LLM_FFN_SWIGLU },
     { "swiglu", LLM_FFN_SWIGLU },
-    { "relu",   LLM_FFN_RELU   },
-    { "reglu",  LLM_FFN_REGLU  },
+    { "relu",   LLM_FFN_RELU      },
+    { "relu2",  LLM_FFN_RELU_SQR  },
+    { "reglu",  LLM_FFN_REGLU     },
 };
 
 llm_ffn_op_type llm_ffn_op_type_from_string(const std::string & name, llm_ffn_op_type fallback) {

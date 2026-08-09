@@ -3,6 +3,12 @@
 void llama_model_bitnet::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
 
+    hparams.llm_ffn_op = LLM_FFN_SILU;
+    std::string hidden_act;
+    if (ml.get_key(LLM_KV_HIDDEN_ACT, hidden_act, false)) {
+        hparams.llm_ffn_op = llm_ffn_op_type_from_string(hidden_act, LLM_FFN_SILU);
+    }
+
     switch (hparams.n_layer()) {
         case 26: type = LLM_TYPE_3B; break;
         case 30: type = LLM_TYPE_2B; break;
@@ -130,7 +136,7 @@ llama_model_bitnet::graph::graph(const llama_model & model, const llm_graph_para
                 model.layers[il].ffn_gate, NULL, model.layers[il].ffn_gate_s,
                 NULL,                      NULL, NULL,
                 NULL,
-                LLM_FFN_SILU, LLM_FFN_PAR, il);
+                hparams.llm_ffn_op, LLM_FFN_PAR, il);
         cb(cur, "ffn_sub_out", il);
 
         cur = build_norm(cur,
@@ -172,6 +178,12 @@ llama_model_bitnet::graph::graph(const llama_model & model, const llm_graph_para
 
 void llama_model_bitnet_b158::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
+
+    hparams.llm_ffn_op = LLM_FFN_SILU;
+    std::string hidden_act;
+    if (ml.get_key(LLM_KV_HIDDEN_ACT, hidden_act, false)) {
+        hparams.llm_ffn_op = llm_ffn_op_type_from_string(hidden_act, LLM_FFN_SILU);
+    }
 
     switch (hparams.n_layer()) {
         case 24: type = LLM_TYPE_700M; break;

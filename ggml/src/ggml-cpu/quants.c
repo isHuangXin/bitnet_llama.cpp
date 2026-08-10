@@ -1388,7 +1388,86 @@ size_t quantize_i2_s(const float * src, void * dst, int64_t nrow, int64_t n_per_
 
 
 static void ggml_vec_dot_i2_i8_s_1x1(int n, float * s, size_t bs, const void * vx, size_t bx, const void * vy, size_t by, int nrc) {
-#if defined(__AVX2__)
+#if defined(__AVX512VNNI__)
+    // AVX-512 VNNI optimized path: uses VPDPBUSD for 4x throughput vs AVX2
+    // Each iteration processes 256 elements (64 bytes of 2-bit weights)
+    const uint8_t * x = (const uint8_t *)vx;
+    const int8_t  * y = (const int8_t *)vy;
+
+    const int nb = n / QK_I2_S;         // number of 128-element blocks
+    const int nb2 = nb / 2;             // pairs of blocks (256 elements = 64B weights)
+    const int nb_rem = nb % 2;
+
+    const __m512i mask = _mm512_set1_epi8(0x03);
+
+    for (int row = 0; row < nrc; row++) {
+        __m512i accu = _mm512_setzero_si512();
+
+        const uint8_t * x_row = x + row * bx / 4;
+
+        for (int i = 0; i < nb2; i++) {
+            // Load 64 bytes of packed 2-bit weights = 256 values
+            const __m512i xraw = _mm512_loadu_si512((const __m512i *)(x_row + i * 64));
+
+            // Unpack: extract 4 groups of 2-bit values
+            // Each byte has 4 values: [b7b6 b5b4 b3b2 b1b0]
+            // After shift+mask, each byte contains one 2-bit value in [0,3]
+            __m512i xq0 = _mm512_and_si512(_mm512_srli_epi16(xraw, 6), mask);  // bits 7:6
+            __m512i xq1 = _mm512_and_si512(_mm512_srli_epi16(xraw, 4), mask);  // bits 5:4
+            __m512i xq2 = _mm512_and_si512(_mm512_srli_epi16(xraw, 2), mask);  // bits 3:2
+            __m512i xq3 = _mm512_and_si512(xraw, mask);                        // bits 1:0
+
+            // Load 256 bytes of int8 activations (4 x 64B)
+            const __m512i yq0 = _mm512_loadu_si512((const __m512i *)(y + i * 256 + 0));
+            const __m512i yq1 = _mm512_loadu_si512((const __m512i *)(y + i * 256 + 64));
+            const __m512i yq2 = _mm512_loadu_si512((const __m512i *)(y + i * 256 + 128));
+            const __m512i yq3 = _mm512_loadu_si512((const __m512i *)(y + i * 256 + 192));
+
+            // VPDPBUSD: dot product of uint8 x int8, accumulate to int32
+            // For each 4-byte group: sum(uint8[i] * int8[i]) added to int32
+            accu = _mm512_dpbusd_epi32(accu, xq0, yq0);
+            accu = _mm512_dpbusd_epi32(accu, xq1, yq1);
+            accu = _mm512_dpbusd_epi32(accu, xq2, yq2);
+            accu = _mm512_dpbusd_epi32(accu, xq3, yq3);
+        }
+
+        // Handle remainder (if nb is odd, process last 128-element block with AVX2-style)
+        if (nb_rem) {
+            const uint8_t * px = x_row + nb2 * 64;
+            const int8_t  * py = y + nb2 * 256;
+
+            __m256i mask256 = _mm256_set1_epi8(0x03);
+            __m256i accu256 = _mm256_setzero_si256();
+
+            __m256i xraw256 = _mm256_loadu_si256((const __m256i *)px);
+            __m256i xq0_256 = _mm256_and_si256(_mm256_srli_epi16(xraw256, 6), mask256);
+            __m256i xq1_256 = _mm256_and_si256(_mm256_srli_epi16(xraw256, 4), mask256);
+            __m256i xq2_256 = _mm256_and_si256(_mm256_srli_epi16(xraw256, 2), mask256);
+            __m256i xq3_256 = _mm256_and_si256(xraw256, mask256);
+
+            __m256i yq0_256 = _mm256_loadu_si256((const __m256i *)(py + 0));
+            __m256i yq1_256 = _mm256_loadu_si256((const __m256i *)(py + 32));
+            __m256i yq2_256 = _mm256_loadu_si256((const __m256i *)(py + 64));
+            __m256i yq3_256 = _mm256_loadu_si256((const __m256i *)(py + 96));
+
+            // Use maddubs + madd for AVX2 remainder
+            __m256i one16 = _mm256_set1_epi16(1);
+            __m256i t0 = _mm256_maddubs_epi16(xq0_256, yq0_256);
+            __m256i t1 = _mm256_maddubs_epi16(xq1_256, yq1_256);
+            __m256i t2 = _mm256_maddubs_epi16(xq2_256, yq2_256);
+            __m256i t3 = _mm256_maddubs_epi16(xq3_256, yq3_256);
+            accu256 = _mm256_add_epi16(accu256, _mm256_add_epi16(t0, t1));
+            accu256 = _mm256_add_epi16(accu256, _mm256_add_epi16(t2, t3));
+            __m256i accu32_256 = _mm256_madd_epi16(accu256, one16);
+
+            // Add remainder to main accumulator (widen to 512)
+            accu = _mm512_add_epi32(accu, _mm512_castsi256_si512(accu32_256));
+        }
+
+        // Horizontal sum of 16 x int32
+        s[row] = (float)_mm512_reduce_add_epi32(accu);
+    }
+#elif defined(__AVX2__)
     const uint8_t *    x = (uint8_t *)vx;
     const int8_t  *    y = (int8_t *)vy;
 

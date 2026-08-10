@@ -12,6 +12,7 @@
 #include "ggml-backend-impl.h"
 #include "ggml-alloc.h"
 #include "ggml-impl.h"
+#include "ggml-pool.h"
 
 #include <assert.h>
 #include <limits.h>
@@ -2224,6 +2225,10 @@ static void * ggml_backend_cpu_buffer_get_base(ggml_backend_buffer_t buffer) {
 
 static void ggml_backend_cpu_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     GGML_ASSERT(buffer);
+    // Skip free if memory belongs to the pool (pool manages its own lifetime)
+    if (ggml_pool_owns(buffer->context)) {
+        return;
+    }
     ggml_aligned_free(buffer->context, buffer->size);
 }
 
@@ -2303,7 +2308,18 @@ static const char * ggml_backend_cpu_buffer_type_get_name(ggml_backend_buffer_ty
 }
 
 static ggml_backend_buffer_t ggml_backend_cpu_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
-    void * data = ggml_aligned_malloc(size);
+    void * data = NULL;
+
+    // Try pool allocation first (for L3 cache-resident inference)
+    if (ggml_pool_is_active()) {
+        data = ggml_pool_alloc(size);
+        if (data != NULL) {
+            return ggml_backend_buffer_init(buft, ggml_backend_cpu_buffer_i, data, size);
+        }
+        GGML_LOG_WARN("%s: pool exhausted, falling back to malloc for %zu bytes\n", __func__, size);
+    }
+
+    data = ggml_aligned_malloc(size);
 
     if (data == NULL) {
         GGML_LOG_ERROR("%s: failed to allocate buffer of size %zu\n", __func__, size);

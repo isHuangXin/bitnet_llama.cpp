@@ -25,6 +25,7 @@
 #include "download.h"
 #include "fit.h"
 #include "ggml.h"
+#include "ggml-pool.h"
 #include "llama.h"
 
 #ifdef _WIN32
@@ -359,6 +360,7 @@ struct cmd_params {
     bool                             verbose;
     bool                             progress;
     bool                             no_warmup;
+    size_t                           pool_size_mb;  // memory pool size in MB (0 = disabled)
     output_formats                   output_format;
     output_formats                   output_format_stderr;
 };
@@ -404,6 +406,7 @@ static const cmd_params cmd_params_defaults = {
     /* verbose              */ false,
     /* progress             */ false,
     /* no_warmup            */ false,
+    /* pool_size_mb         */ 0,
     /* output_format        */ MARKDOWN,
     /* output_format_stderr */ NONE,
 };
@@ -423,6 +426,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -v, --verbose                               verbose output\n");
     printf("  --progress                                  print test progress indicators\n");
     printf("  --no-warmup                                 skip warmup runs before benchmarking\n");
+    printf("  --pool-size <MB>                            fixed memory pool size in MB for L3 cache-resident inference (default: 0 = disabled)\n");
     printf("  -fitt, --fit-target <MiB>                   fit model to device memory with this margin per device in MiB (default: off)\n");
     printf("  -fitc, --fit-ctx <n>                        minimum ctx size for --fit-target (default: 4096)\n");
     if (llama_supports_rpc()) {
@@ -520,6 +524,7 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     params.delay                = cmd_params_defaults.delay;
     params.progress             = cmd_params_defaults.progress;
     params.no_warmup            = cmd_params_defaults.no_warmup;
+    params.pool_size_mb         = cmd_params_defaults.pool_size_mb;
 
     if (const char * env = getenv("HF_TOKEN")) {
         params.hf_token = env;
@@ -998,6 +1003,12 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 params.progress = true;
             } else if (arg == "--no-warmup") {
                 params.no_warmup = true;
+            } else if (arg == "--pool-size") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                params.pool_size_mb = std::stoul(argv[i]);
             } else if (arg == "-fitt" || arg == "--fit-target") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -2204,6 +2215,16 @@ int llama_bench(int argc, char ** argv) {
     llama_backend_init();
     llama_numa_init(params.numa);
 
+    // Initialize fixed-size memory pool for L3 cache-resident inference
+    if (params.pool_size_mb > 0) {
+        size_t pool_bytes = params.pool_size_mb * 1024 * 1024;
+        if (ggml_pool_init(pool_bytes) != 0) {
+            fprintf(stderr, "%s: error: failed to initialize memory pool of %zu MB\n", __func__, params.pool_size_mb);
+            return 1;
+        }
+        fprintf(stderr, "%s: memory pool initialized: %zu MB\n", __func__, params.pool_size_mb);
+    }
+
     if (!set_process_priority(params.prio)) {
         fprintf(stderr, "%s: error: failed to set process priority\n", __func__);
         return 1;
@@ -2325,6 +2346,11 @@ int llama_bench(int argc, char ** argv) {
         }
 
         llama_attach_threadpool(ctx, threadpool, NULL);
+
+        // L3 cache warmup: pre-heat all pool memory into cache before timing
+        if (ggml_pool_is_active()) {
+            ggml_pool_warmup_l3();
+        }
 
         // warmup run
         if (!params.no_warmup) {
@@ -2456,6 +2482,10 @@ int llama_bench(int argc, char ** argv) {
     }
 
     llama_backend_free();
+
+    if (ggml_pool_is_active()) {
+        ggml_pool_destroy();
+    }
 
     return 0;
 }

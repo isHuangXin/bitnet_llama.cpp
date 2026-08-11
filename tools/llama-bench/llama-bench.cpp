@@ -2223,6 +2223,14 @@ int llama_bench(int argc, char ** argv) {
             return 1;
         }
         fprintf(stderr, "%s: memory pool initialized: %zu MB\n", __func__, params.pool_size_mb);
+
+        // In pool mode, limit n_ubatch to control prefill chunk size and peak compute buffer
+        for (auto & nub : params.n_ubatch) {
+            if (nub > 512) {
+                fprintf(stderr, "%s: pool mode: clamping n_ubatch from %d to 512\n", __func__, nub);
+                nub = 512;
+            }
+        }
     }
 
     if (!set_process_priority(params.prio)) {

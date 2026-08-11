@@ -22,9 +22,16 @@ void llama_model_bitnet::load_arch_hparams(llama_model_loader & ml) {
         // Cross-decoder layers (21-27) use no-cache shared KV attention
         hparams.n_layer_kv_from_start = (int32_t)n_self_unrolled;
 
-        // Note: swa_type remains NONE — we use regular KV cache with sliding_window
-        // The sliding_window parameter applies window-based masking to all KV cache layers
-        // This is functionally equivalent to SWA for self-decoder layers
+        // Enable ISWA KV cache path: SWA cache allocates only n_swa+n_ubatch cells
+        // instead of full n_ctx, critical for L3 cache-resident inference
+        hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
+
+        // Mark self-decoder layers as SWA so they use the small window cache
+        for (uint32_t il = 0; il < n_self_unrolled; ++il) {
+            hparams.is_swa_impl[il] = 1;
+        }
+        // Cross-decoder layers (n_self_unrolled..n_layer_total) stay is_swa=0,
+        // and are excluded from KV cache by n_layer_kv_from_start anyway
     }
 
     switch (hparams.n_layer()) {
@@ -106,7 +113,15 @@ llama_model_bitnet::graph::graph(const llama_model & model, const llm_graph_para
     // inp_pos - contains the positions
     ggml_tensor * inp_pos = build_inp_pos();
 
-    auto * inp_attn = build_attn_inp_kv();
+    // For YOCO-U: use ISWA KV cache (small SWA window) for self-decoder layers
+    llm_graph_input_attn_kv_iswa * inp_attn_iswa = nullptr;
+    llm_graph_input_attn_kv      * inp_attn_kv   = nullptr;
+
+    if (is_yoco_u) {
+        inp_attn_iswa = build_attn_inp_kv_iswa();
+    } else {
+        inp_attn_kv = build_attn_inp_kv();
+    }
 
     // For YOCO-U cross-decoder: no-cache attention
     auto * inp_attn_nc = is_yoco_u ? build_attn_inp_no_cache() : nullptr;
@@ -153,7 +168,11 @@ llama_model_bitnet::graph::graph(const llama_model & model, const llm_graph_para
                 cb(Kcur, "Kcur", il);
                 cb(Vcur, "Vcur", il);
 
-                cur = build_attn(inp_attn,
+                cur = is_yoco_u
+                    ? build_attn(inp_attn_iswa,
+                        NULL, NULL, NULL,
+                        Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, 1.0f/sqrtf(float(n_embd_head)), il)
+                    : build_attn(inp_attn_kv,
                         NULL, NULL, NULL,
                         Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, 1.0f/sqrtf(float(n_embd_head)), il);
             } else {

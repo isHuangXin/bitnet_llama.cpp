@@ -466,6 +466,12 @@ void llm_graph_input_attn_no_cache::set_input(const llama_ubatch * ubatch) {
     };
 
     GGML_ASSERT(self_kq_mask);
+
+    // self_kq_mask may have a dangling buffer pointer when used alongside ISWA KV cache
+    if (!self_kq_mask->data) {
+        return;
+    }
+
     GGML_ASSERT(ggml_backend_buffer_is_host(self_kq_mask->buffer));
     if (self_kq_mask->type == GGML_TYPE_F16) {
         fill_mask((ggml_fp16_t *) self_kq_mask->data, ggml_nelements(self_kq_mask), 0, LLAMA_SWA_TYPE_NONE);
@@ -473,15 +479,8 @@ void llm_graph_input_attn_no_cache::set_input(const llama_ubatch * ubatch) {
         fill_mask((float       *) self_kq_mask->data, ggml_nelements(self_kq_mask), 0, LLAMA_SWA_TYPE_NONE);
     }
 
-    if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
-        GGML_ASSERT(self_kq_mask_swa);
-        GGML_ASSERT(ggml_backend_buffer_is_host(self_kq_mask_swa->buffer));
-        if (self_kq_mask_swa->type == GGML_TYPE_F16) {
-            fill_mask((ggml_fp16_t *) self_kq_mask_swa->data, ggml_nelements(self_kq_mask_swa), hparams.n_swa, hparams.swa_type);
-        } else {
-            fill_mask((float       *) self_kq_mask_swa->data, ggml_nelements(self_kq_mask_swa), hparams.n_swa, hparams.swa_type);
-        }
-    }
+    // no-cache attention never uses SWA masks (self_kq_mask_swa is always nullptr)
+    GGML_UNUSED(hparams);
 }
 
 void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
@@ -2519,15 +2518,11 @@ llm_graph_input_attn_no_cache * llm_graph_context::build_attn_inp_no_cache() con
 
     inp->self_kq_mask_cnv = inp->self_kq_mask;
 
-    if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
-        inp->self_kq_mask_swa = ggml_new_tensor_4d(ctx0, type_mask, n_tokens, n_tokens, 1, 1);
-        ggml_set_input(inp->self_kq_mask_swa);
-
-        inp->self_kq_mask_swa_cnv = inp->self_kq_mask_swa;
-    } else {
-        inp->self_kq_mask_swa     = nullptr;
-        inp->self_kq_mask_swa_cnv = nullptr;
-    }
+    // Note: no-cache attention does not use SWA masks even when swa_type is set globally.
+    // SWA is only relevant for KV-cached attention layers. Creating unused SWA mask tensors
+    // here would leave them unconnected in the graph, causing dangling buffer pointers.
+    inp->self_kq_mask_swa     = nullptr;
+    inp->self_kq_mask_swa_cnv = nullptr;
 
     return (llm_graph_input_attn_no_cache *) res->add_input(std::move(inp));
 }

@@ -578,6 +578,13 @@ struct llama_model {
     struct ggml_tensor * yoco_cross_kv_norm = nullptr;
     struct ggml_tensor * yoco_cross_k       = nullptr;
     struct ggml_tensor * yoco_cross_v       = nullptr;
+    struct ggml_tensor * yoco_cross_k_norm  = nullptr;
+
+    // BitNet embedding projections
+    struct ggml_tensor * emb_proj_in   = nullptr;
+    struct ggml_tensor * emb_proj_out  = nullptr;
+    struct ggml_tensor * emb_in_norm   = nullptr;
+    struct ggml_tensor * emb_out_norm  = nullptr;
 
 
     // NVFP4 per-tensor scale2, input_scale for LM head

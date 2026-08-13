@@ -19,7 +19,26 @@
 
 #ifdef __linux__
 #include <sys/mman.h>
+#include <sys/syscall.h>
 #include <unistd.h>
+#include <pthread.h>
+
+// mbind constants - avoid requiring libnuma-dev at link time
+#ifndef MPOL_BIND
+#define MPOL_BIND       2
+#endif
+#ifndef MPOL_MF_MOVE
+#define MPOL_MF_MOVE    (1 << 1)
+#endif
+#ifndef MPOL_MF_STRICT
+#define MPOL_MF_STRICT  (1 << 0)
+#endif
+
+static long pool_mbind(void *addr, unsigned long len, int mode,
+                       const unsigned long *nodemask, unsigned long maxnode,
+                       unsigned flags) {
+    return syscall(SYS_mbind, addr, len, mode, nodemask, maxnode, flags);
+}
 #endif
 
 #define POOL_ALIGNMENT 64  // cache line size
@@ -29,10 +48,15 @@ static struct {
     size_t  capacity;
     size_t  used;
     size_t  compute_mark;  // offset where compute zone begins
+    size_t  weight_mark;   // offset where weights end (for mprotect)
     int     initialized;
-} g_pool = { NULL, 0, 0, 0, 0 };
+} g_pool = { NULL, 0, 0, 0, 0, 0 };
 
 int ggml_pool_init(size_t pool_size_bytes) {
+    return ggml_pool_init_numa(pool_size_bytes, -1);
+}
+
+int ggml_pool_init_numa(size_t pool_size_bytes, int numa_node) {
     if (g_pool.initialized) {
         fprintf(stderr, "[ggml-pool] already initialized\n");
         return 0;
@@ -48,6 +72,18 @@ int ggml_pool_init(size_t pool_size_bytes) {
     if (ptr == MAP_FAILED) {
         perror("[ggml-pool] mmap failed");
         return -1;
+    }
+
+    // NUMA binding: force physical pages onto the specified NUMA node
+    if (numa_node >= 0) {
+        unsigned long nodemask = 1UL << numa_node;
+        if (pool_mbind(ptr, pool_size_bytes, MPOL_BIND, &nodemask,
+                  sizeof(nodemask) * 8, MPOL_MF_MOVE | MPOL_MF_STRICT) != 0) {
+            perror("[ggml-pool] mbind failed (NUMA binding)");
+            // Continue anyway - NUMA binding is best-effort
+        } else {
+            fprintf(stderr, "[ggml-pool] bound to NUMA node %d\n", numa_node);
+        }
     }
 
     // Lock pages in RAM - prevent swapping
@@ -146,6 +182,34 @@ void ggml_pool_reset_compute_zone(void) {
     }
 }
 
+void ggml_pool_protect_weights(void) {
+    if (!g_pool.initialized || g_pool.weight_mark == 0) return;
+
+#ifdef __linux__
+    // Round down to page boundary for mprotect
+    size_t page_size = (size_t)sysconf(_SC_PAGESIZE);
+    size_t protect_size = g_pool.weight_mark & ~(page_size - 1);
+    if (protect_size > 0) {
+        if (mprotect(g_pool.base, protect_size, PROT_READ) != 0) {
+            perror("[ggml-pool] mprotect(PROT_READ) failed");
+        } else {
+            fprintf(stderr, "[ggml-pool] weight region protected as read-only (%.2f MB)\n",
+                    (double)protect_size / (1024.0 * 1024.0));
+        }
+    }
+#endif
+}
+
+void ggml_pool_mark_weights(void) {
+    g_pool.weight_mark = g_pool.used;
+    fprintf(stderr, "[ggml-pool] weight mark at offset %zu (%.2f MB)\n",
+            g_pool.weight_mark, (double)g_pool.weight_mark / (1024.0 * 1024.0));
+}
+
+size_t ggml_pool_get_weight_mark(void) {
+    return g_pool.weight_mark;
+}
+
 size_t ggml_pool_get_used(void) {
     return g_pool.used;
 }
@@ -193,4 +257,77 @@ int ggml_pool_owns(const void * ptr) {
     uintptr_t addr = (uintptr_t)ptr;
     uintptr_t base = (uintptr_t)g_pool.base;
     return (addr >= base && addr < base + g_pool.capacity);
+}
+
+#ifdef __linux__
+struct warmup_thread_arg {
+    volatile char * base;
+    size_t          offset;
+    size_t          length;
+};
+
+static void * warmup_thread_fn(void * arg) {
+    struct warmup_thread_arg * a = (struct warmup_thread_arg *)arg;
+    volatile char * p = a->base + a->offset;
+    size_t n = a->length;
+
+    // Pass 1: sequential read
+    for (size_t i = 0; i < n; i += 64) {
+        (void)p[i];
+    }
+    // Pass 2: read-modify-write for M/E state
+    for (size_t i = 0; i < n; i += 64) {
+        p[i] = p[i];
+    }
+    // Pass 3: reverse traversal
+    for (size_t i = n > 64 ? n - 64 : 0; i > 0; i -= 64) {
+        (void)p[i];
+    }
+    return NULL;
+}
+#endif
+
+void ggml_pool_warmup_l3_parallel(int n_threads) {
+    if (!g_pool.initialized) return;
+
+    size_t size = g_pool.used;
+    if (size == 0) size = g_pool.capacity;
+
+    if (n_threads <= 1) {
+        ggml_pool_warmup_l3();
+        return;
+    }
+
+#ifdef __linux__
+    fprintf(stderr, "[ggml-pool] warming up %.2f MB into L3 cache with %d threads...\n",
+            (double)size / (1024.0 * 1024.0), n_threads);
+
+    pthread_t * threads = (pthread_t *)malloc(n_threads * sizeof(pthread_t));
+    struct warmup_thread_arg * args = (struct warmup_thread_arg *)malloc(n_threads * sizeof(struct warmup_thread_arg));
+
+    size_t chunk = (size + n_threads - 1) / n_threads;
+    // Align chunk to cache line
+    chunk = (chunk + 63) & ~(size_t)63;
+
+    for (int i = 0; i < n_threads; i++) {
+        args[i].base   = (volatile char *)g_pool.base;
+        args[i].offset = i * chunk;
+        args[i].length = (i == n_threads - 1) ? (size - args[i].offset) : chunk;
+        if (args[i].offset >= size) {
+            args[i].length = 0;
+        }
+        pthread_create(&threads[i], NULL, warmup_thread_fn, &args[i]);
+    }
+
+    for (int i = 0; i < n_threads; i++) {
+        pthread_join(threads[i], NULL);
+    }
+
+    free(threads);
+    free(args);
+
+    fprintf(stderr, "[ggml-pool] warmup complete\n");
+#else
+    ggml_pool_warmup_l3();
+#endif
 }

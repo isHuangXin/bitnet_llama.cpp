@@ -11,8 +11,10 @@ extern "C" {
 
 // Initialize the memory pool with a fixed size (e.g., 48MB)
 // Uses MAP_POPULATE + mlock + MADV_HUGEPAGE for guaranteed physical residency
+// numa_node: bind to specific NUMA node (-1 = no binding)
 // Returns 0 on success, -1 on failure
 int ggml_pool_init(size_t pool_size_bytes);
+int ggml_pool_init_numa(size_t pool_size_bytes, int numa_node);
 
 // Destroy the memory pool
 void ggml_pool_destroy(void);
@@ -39,6 +41,20 @@ void * ggml_pool_get_base(void);
 // Warmup: sequential read over all used memory to fill L3 cache
 // Call after model loading and before benchmark timing
 void ggml_pool_warmup_l3(void);
+
+// Warmup with multiple threads to fill all L3 cache slices
+// Each thread warms a different region of the pool
+void ggml_pool_warmup_l3_parallel(int n_threads);
+
+// Make the weight region (0 to compute_mark) read-only
+// This enables Shared cache line state for multi-core access (like mmap PROT_READ)
+void ggml_pool_protect_weights(void);
+
+// Mark current usage as the weight boundary (call after model load, before context creation)
+void ggml_pool_mark_weights(void);
+
+// Get weight mark offset
+size_t ggml_pool_get_weight_mark(void);
 
 // Check if a pointer belongs to the pool (used to skip free)
 int ggml_pool_owns(const void * ptr);

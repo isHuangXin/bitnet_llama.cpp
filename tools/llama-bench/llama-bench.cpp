@@ -1202,6 +1202,11 @@ struct cmd_params_instance {
         mparams.use_direct_io = use_direct_io;
         mparams.no_host       = no_host;
 
+        // In pool mode, mlock mmap'd weights to keep them in cache
+        if (ggml_pool_is_active()) {
+            mparams.use_mlock = true;
+        }
+
         if (n_cpu_moe <= 0) {
             if (tensor_buft_overrides.empty()) {
                 mparams.tensor_buft_overrides = nullptr;
@@ -2357,7 +2362,7 @@ int llama_bench(int argc, char ** argv) {
 
         // L3 cache warmup: pre-heat all pool memory into cache before timing
         if (ggml_pool_is_active()) {
-            ggml_pool_warmup_l3();
+            ggml_pool_warmup_l3_parallel(t.n_threads);
         }
 
         // warmup run

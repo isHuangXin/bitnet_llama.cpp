@@ -169,46 +169,50 @@ llama_model_bitnet::graph::graph(const llama_model & model, const llm_graph_para
         {
             ggml_tensor * Qcur = ggml_mul_mat(ctx0, model.layers[il].wq, cur);
 
+            // Reshape Q to 3D [head_dim, n_head, n_tokens] BEFORE RMS-clip
+            // so that RMS-clip operates per-head (matching PyTorch which does
+            // mean(dim=-1) over head_dim after view(n_tokens, n_head, head_dim))
+            Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head_il, n_tokens);
+
             if (model.layers[il].attn_q_norm) {
-                // RMS-clip: coeff = min(limit * rsqrt(mean(x^2) + eps), 1.0)
-                // Only shrinks vectors with rms > limit; never amplifies
+                // RMS-clip per head: coeff = min(limit * rsqrt(mean(x^2) + eps), 1.0)
+                // Only shrinks heads with rms > limit; never amplifies
                 const float qk_rms_limit = 3.0f;
                 const float eps = hparams.f_norm_rms_eps;
-                const int64_t row_len = Qcur->ne[0];
 
                 ggml_tensor * x_sq      = ggml_sqr(ctx0, Qcur);
-                ggml_tensor * sq_sum    = ggml_sum_rows(ctx0, x_sq);          // [1, n_tokens]
-                ggml_tensor * variance  = ggml_scale(ctx0, sq_sum, 1.0f / (float)row_len);
-                // variance + eps: use ggml_add with a constant tensor
-                ggml_tensor * eps_t     = ggml_fill(ctx0, variance, eps);     // same shape, filled with eps
+                ggml_tensor * sq_sum    = ggml_sum_rows(ctx0, x_sq);          // [1, n_head, n_tokens]
+                ggml_tensor * variance  = ggml_scale(ctx0, sq_sum, 1.0f / (float)n_embd_head);
+                ggml_tensor * eps_t     = ggml_fill(ctx0, variance, eps);
                 ggml_tensor * var_eps   = ggml_add(ctx0, variance, eps_t);
-                ggml_tensor * rms       = ggml_sqrt(ctx0, var_eps);           // sqrt(mean(x^2) + eps)
-                // inv_rms = 1 / rms
-                ggml_tensor * ones      = ggml_fill(ctx0, rms, 1.0f);
-                ggml_tensor * inv_rms   = ggml_div(ctx0, ones, rms);
-                // coeff = clamp(limit * inv_rms, max=1.0)
+                ggml_tensor * rms       = ggml_sqrt(ctx0, var_eps);
+                ggml_tensor * ones_t    = ggml_fill(ctx0, rms, 1.0f);
+                ggml_tensor * inv_rms   = ggml_div(ctx0, ones_t, rms);
                 ggml_tensor * coeff     = ggml_scale(ctx0, inv_rms, qk_rms_limit);
                 coeff = ggml_clamp(ctx0, coeff, 0.0f, 1.0f);
-                // Qcur = Qcur * coeff (broadcast) * weight
+                // Qcur = Qcur * coeff (broadcast over head_dim) * weight
                 Qcur = ggml_mul(ctx0, Qcur, coeff);
-                Qcur = ggml_mul(ctx0, Qcur, model.layers[il].attn_q_norm);
+                // weight shape [q_dim] -> reshape to [head_dim, n_head] for per-element scaling
+                ggml_tensor * q_norm_3d = ggml_reshape_3d(ctx0, model.layers[il].attn_q_norm, n_embd_head, n_head_il, 1);
+                Qcur = ggml_mul(ctx0, Qcur, q_norm_3d);
             }
-            Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head_il, n_tokens);
 
             if (!is_cross_layer) {
                 // Self-decoder
                 ggml_tensor * Kcur = ggml_mul_mat(ctx0, model.layers[il].wk, cur);
                 ggml_tensor * Vcur = ggml_mul_mat(ctx0, model.layers[il].wv, cur);
 
+                // Reshape K to 3D before RMS-clip (per-head normalization)
+                Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv_il, n_tokens);
+
                 if (model.layers[il].attn_k_norm) {
-                    // RMS-clip for K norm (same as Q norm above)
+                    // RMS-clip per head for K norm
                     const float qk_rms_limit = 3.0f;
                     const float eps = hparams.f_norm_rms_eps;
-                    const int64_t k_row_len = Kcur->ne[0];
 
                     ggml_tensor * k_sq      = ggml_sqr(ctx0, Kcur);
-                    ggml_tensor * k_sq_sum  = ggml_sum_rows(ctx0, k_sq);
-                    ggml_tensor * k_var     = ggml_scale(ctx0, k_sq_sum, 1.0f / (float)k_row_len);
+                    ggml_tensor * k_sq_sum  = ggml_sum_rows(ctx0, k_sq);       // [1, n_head_kv, n_tokens]
+                    ggml_tensor * k_var     = ggml_scale(ctx0, k_sq_sum, 1.0f / (float)n_embd_head);
                     ggml_tensor * k_eps_t   = ggml_fill(ctx0, k_var, eps);
                     ggml_tensor * k_var_eps = ggml_add(ctx0, k_var, k_eps_t);
                     ggml_tensor * k_rms     = ggml_sqrt(ctx0, k_var_eps);
@@ -217,9 +221,9 @@ llama_model_bitnet::graph::graph(const llama_model & model, const llm_graph_para
                     ggml_tensor * k_coeff   = ggml_scale(ctx0, k_inv_rms, qk_rms_limit);
                     k_coeff = ggml_clamp(ctx0, k_coeff, 0.0f, 1.0f);
                     Kcur = ggml_mul(ctx0, Kcur, k_coeff);
-                    Kcur = ggml_mul(ctx0, Kcur, model.layers[il].attn_k_norm);
+                    ggml_tensor * k_norm_3d = ggml_reshape_3d(ctx0, model.layers[il].attn_k_norm, n_embd_head, n_head_kv_il, 1);
+                    Kcur = ggml_mul(ctx0, Kcur, k_norm_3d);
                 }
-                Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv_il, n_tokens);
                 Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv_il, n_tokens);
 
                 Qcur = ggml_rope_ext(ctx0, Qcur, inp_pos, nullptr,
@@ -347,15 +351,16 @@ llama_model_bitnet::graph::graph(const llama_model & model, const llm_graph_para
             ggml_tensor * normed = build_norm(inpL, model.yoco_cross_kv_norm, NULL, LLM_NORM_RMS, -1);
 
             shared_K = ggml_mul_mat(ctx0, model.yoco_cross_k, normed);
+            // Reshape to 3D before RMS-clip (per-head normalization)
+            shared_K = ggml_reshape_3d(ctx0, shared_K, n_embd_head, n_head_kv_cross, n_tokens);
             if (model.yoco_cross_k_norm) {
-                // RMS-clip for cross K norm
+                // RMS-clip per head for cross K norm
                 const float qk_rms_limit = 3.0f;
                 const float eps = hparams.f_norm_rms_eps;
-                const int64_t ck_row_len = shared_K->ne[0];
 
                 ggml_tensor * ck_sq      = ggml_sqr(ctx0, shared_K);
-                ggml_tensor * ck_sq_sum  = ggml_sum_rows(ctx0, ck_sq);
-                ggml_tensor * ck_var     = ggml_scale(ctx0, ck_sq_sum, 1.0f / (float)ck_row_len);
+                ggml_tensor * ck_sq_sum  = ggml_sum_rows(ctx0, ck_sq);       // [1, n_head_kv, n_tokens]
+                ggml_tensor * ck_var     = ggml_scale(ctx0, ck_sq_sum, 1.0f / (float)n_embd_head);
                 ggml_tensor * ck_eps_t   = ggml_fill(ctx0, ck_var, eps);
                 ggml_tensor * ck_var_eps = ggml_add(ctx0, ck_var, ck_eps_t);
                 ggml_tensor * ck_rms     = ggml_sqrt(ctx0, ck_var_eps);
@@ -364,9 +369,10 @@ llama_model_bitnet::graph::graph(const llama_model & model, const llm_graph_para
                 ggml_tensor * ck_coeff   = ggml_scale(ctx0, ck_inv_rms, qk_rms_limit);
                 ck_coeff = ggml_clamp(ctx0, ck_coeff, 0.0f, 1.0f);
                 shared_K = ggml_mul(ctx0, shared_K, ck_coeff);
-                shared_K = ggml_mul(ctx0, shared_K, model.yoco_cross_k_norm);
+                ggml_tensor * ck_norm_3d = ggml_reshape_3d(ctx0, model.yoco_cross_k_norm, n_embd_head, n_head_kv_cross, 1);
+                shared_K = ggml_mul(ctx0, shared_K, ck_norm_3d);
             }
-            shared_K = ggml_reshape_3d(ctx0, shared_K, n_embd_head, n_head_kv_cross, n_tokens);
+            // shared_K is already 3D [head_dim, n_head_kv, n_tokens]
             shared_K = ggml_rope_ext(ctx0, shared_K, inp_pos, nullptr,
                     n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
                     ext_factor, attn_factor, beta_fast, beta_slow);

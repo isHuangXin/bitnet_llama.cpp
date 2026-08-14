@@ -2043,6 +2043,22 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             }
 
             if (has_gate) {
+                if (!gate_exps && il >= 0) {
+                    // gate_up_exps path: check for swiglu clamping
+                    const float limit = hparams.swiglu_clamp_exp[il];
+                    constexpr float eps2 = 1e-6f;
+                    if (limit > eps2) {
+                        up = ggml_clamp(ctx0, up, -limit, limit);
+                        cb(up, "ffn_moe_up_clamped", il);
+                        ggml_tensor * gate_act = ggml_silu(ctx0, cur);
+                        cb(gate_act, "ffn_moe_silu", il);
+                        gate_act = ggml_clamp(ctx0, gate_act, -INFINITY, limit);
+                        cb(gate_act, "ffn_moe_silu_clamped", il);
+                        cur = ggml_mul(ctx0, gate_act, up);
+                        cb(cur, "ffn_moe_swiglu_limited", il);
+                        break;
+                    }
+                }
                 cur = ggml_swiglu_split(ctx0, cur, up);
                 cb(cur, "ffn_moe_swiglu", il);
             } else {

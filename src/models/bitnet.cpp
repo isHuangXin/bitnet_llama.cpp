@@ -20,6 +20,14 @@ void llama_model_bitnet::load_arch_hparams(llama_model_loader & ml) {
         }
     }
 
+    // SwiGLU clamping: default to 10.0 for all layers (matching PyTorch swiglu_limit=10.0)
+    if (!ml.get_key_or_arr(LLM_KV_SWIGLU_CLAMP_EXP, hparams.swiglu_clamp_exp, hparams.n_layer(), false)) {
+        hparams.swiglu_clamp_exp.fill(10.0f);
+    }
+    if (!ml.get_key_or_arr(LLM_KV_SWIGLU_CLAMP_SHEXP, hparams.swiglu_clamp_shexp, hparams.n_layer(), false)) {
+        hparams.swiglu_clamp_shexp = hparams.swiglu_clamp_exp;
+    }
+
     switch (hparams.n_layer()) {
         case 20: type = LLM_TYPE_UNKNOWN; break; // YOCO-MoE 20 layers
         case 26: type = LLM_TYPE_3B; break;
@@ -162,6 +170,27 @@ llama_model_bitnet::graph::graph(const llama_model & model, const llm_graph_para
             ggml_tensor * Qcur = ggml_mul_mat(ctx0, model.layers[il].wq, cur);
 
             if (model.layers[il].attn_q_norm) {
+                // RMS-clip: coeff = min(limit * rsqrt(mean(x^2) + eps), 1.0)
+                // Only shrinks vectors with rms > limit; never amplifies
+                const float qk_rms_limit = 3.0f;
+                const float eps = hparams.f_norm_rms_eps;
+                const int64_t row_len = Qcur->ne[0];
+
+                ggml_tensor * x_sq      = ggml_sqr(ctx0, Qcur);
+                ggml_tensor * sq_sum    = ggml_sum_rows(ctx0, x_sq);          // [1, n_tokens]
+                ggml_tensor * variance  = ggml_scale(ctx0, sq_sum, 1.0f / (float)row_len);
+                // variance + eps: use ggml_add with a constant tensor
+                ggml_tensor * eps_t     = ggml_fill(ctx0, variance, eps);     // same shape, filled with eps
+                ggml_tensor * var_eps   = ggml_add(ctx0, variance, eps_t);
+                ggml_tensor * rms       = ggml_sqrt(ctx0, var_eps);           // sqrt(mean(x^2) + eps)
+                // inv_rms = 1 / rms
+                ggml_tensor * ones      = ggml_fill(ctx0, rms, 1.0f);
+                ggml_tensor * inv_rms   = ggml_div(ctx0, ones, rms);
+                // coeff = clamp(limit * inv_rms, max=1.0)
+                ggml_tensor * coeff     = ggml_scale(ctx0, inv_rms, qk_rms_limit);
+                coeff = ggml_clamp(ctx0, coeff, 0.0f, 1.0f);
+                // Qcur = Qcur * coeff (broadcast) * weight
+                Qcur = ggml_mul(ctx0, Qcur, coeff);
                 Qcur = ggml_mul(ctx0, Qcur, model.layers[il].attn_q_norm);
             }
             Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head_il, n_tokens);
@@ -172,6 +201,22 @@ llama_model_bitnet::graph::graph(const llama_model & model, const llm_graph_para
                 ggml_tensor * Vcur = ggml_mul_mat(ctx0, model.layers[il].wv, cur);
 
                 if (model.layers[il].attn_k_norm) {
+                    // RMS-clip for K norm (same as Q norm above)
+                    const float qk_rms_limit = 3.0f;
+                    const float eps = hparams.f_norm_rms_eps;
+                    const int64_t k_row_len = Kcur->ne[0];
+
+                    ggml_tensor * k_sq      = ggml_sqr(ctx0, Kcur);
+                    ggml_tensor * k_sq_sum  = ggml_sum_rows(ctx0, k_sq);
+                    ggml_tensor * k_var     = ggml_scale(ctx0, k_sq_sum, 1.0f / (float)k_row_len);
+                    ggml_tensor * k_eps_t   = ggml_fill(ctx0, k_var, eps);
+                    ggml_tensor * k_var_eps = ggml_add(ctx0, k_var, k_eps_t);
+                    ggml_tensor * k_rms     = ggml_sqrt(ctx0, k_var_eps);
+                    ggml_tensor * k_ones    = ggml_fill(ctx0, k_rms, 1.0f);
+                    ggml_tensor * k_inv_rms = ggml_div(ctx0, k_ones, k_rms);
+                    ggml_tensor * k_coeff   = ggml_scale(ctx0, k_inv_rms, qk_rms_limit);
+                    k_coeff = ggml_clamp(ctx0, k_coeff, 0.0f, 1.0f);
+                    Kcur = ggml_mul(ctx0, Kcur, k_coeff);
                     Kcur = ggml_mul(ctx0, Kcur, model.layers[il].attn_k_norm);
                 }
                 Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv_il, n_tokens);
@@ -192,9 +237,7 @@ llama_model_bitnet::graph::graph(const llama_model & model, const llm_graph_para
             } else {
                 // Cross-decoder with shared KV
                 GGML_ASSERT(shared_K && shared_V);
-                Qcur = ggml_rope_ext(ctx0, Qcur, inp_pos, nullptr,
-                        n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
-                        ext_factor, attn_factor, beta_fast, beta_slow);
+                // Cross-decoder: no RoPE on Q (shared K already has RoPE applied)
                 cb(Qcur, "Qcur", il);
 
                 cur = build_attn(inp_attn_nc, NULL, NULL, NULL,
@@ -254,7 +297,7 @@ llama_model_bitnet::graph::graph(const llama_model & model, const llm_graph_para
                     model.layers[il].ffn_down_exps,
                     nullptr,
                     n_expert_count, n_expert_top_k,
-                    LLM_FFN_SILU, false, 0.0f,
+                    LLM_FFN_SILU, true, 0.0f,
                     LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX,
                     il,
                     nullptr,
@@ -305,6 +348,22 @@ llama_model_bitnet::graph::graph(const llama_model & model, const llm_graph_para
 
             shared_K = ggml_mul_mat(ctx0, model.yoco_cross_k, normed);
             if (model.yoco_cross_k_norm) {
+                // RMS-clip for cross K norm
+                const float qk_rms_limit = 3.0f;
+                const float eps = hparams.f_norm_rms_eps;
+                const int64_t ck_row_len = shared_K->ne[0];
+
+                ggml_tensor * ck_sq      = ggml_sqr(ctx0, shared_K);
+                ggml_tensor * ck_sq_sum  = ggml_sum_rows(ctx0, ck_sq);
+                ggml_tensor * ck_var     = ggml_scale(ctx0, ck_sq_sum, 1.0f / (float)ck_row_len);
+                ggml_tensor * ck_eps_t   = ggml_fill(ctx0, ck_var, eps);
+                ggml_tensor * ck_var_eps = ggml_add(ctx0, ck_var, ck_eps_t);
+                ggml_tensor * ck_rms     = ggml_sqrt(ctx0, ck_var_eps);
+                ggml_tensor * ck_ones    = ggml_fill(ctx0, ck_rms, 1.0f);
+                ggml_tensor * ck_inv_rms = ggml_div(ctx0, ck_ones, ck_rms);
+                ggml_tensor * ck_coeff   = ggml_scale(ctx0, ck_inv_rms, qk_rms_limit);
+                ck_coeff = ggml_clamp(ctx0, ck_coeff, 0.0f, 1.0f);
+                shared_K = ggml_mul(ctx0, shared_K, ck_coeff);
                 shared_K = ggml_mul(ctx0, shared_K, model.yoco_cross_k_norm);
             }
             shared_K = ggml_reshape_3d(ctx0, shared_K, n_embd_head, n_head_kv_cross, n_tokens);
@@ -319,15 +378,14 @@ llama_model_bitnet::graph::graph(const llama_model & model, const llm_graph_para
 
     cur = inpL;
 
-    // Embedding projection out
-    if (model.emb_out_norm) {
-        cur = build_norm(cur, model.emb_out_norm, NULL, LLM_NORM_RMS, -1);
-    }
+    // Embedding projection out: output_norm → emb_proj_out → emb_out_norm
+    cur = build_norm(cur, model.output_norm, NULL, LLM_NORM_RMS, -1);
     if (model.emb_proj_out) {
         cur = ggml_mul_mat(ctx0, model.emb_proj_out, cur);
     }
-
-    cur = build_norm(cur, model.output_norm, NULL, LLM_NORM_RMS, -1);
+    if (model.emb_out_norm) {
+        cur = build_norm(cur, model.emb_out_norm, NULL, LLM_NORM_RMS, -1);
+    }
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 

@@ -1652,6 +1652,14 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
 
     float tmp[16];
 
+    // I2_S: need act_scales/act_sums for post-processing (scale is per-expert, set later)
+    const float * i2s_act_scales = NULL;
+    const int32_t * i2s_act_sums = NULL;
+    if (type == GGML_TYPE_I2_S) {
+        i2s_act_scales = (const float *)((const char *)wdata + (ne11 * ne10));
+        i2s_act_sums = (const int32_t *)((const char *)i2s_act_scales + ne11 * sizeof(float));
+    }
+
     for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += blck_1) {
         for (int64_t iir0 = ir0_start; iir0 < ir0_end; iir0 += blck_0) {
             for (int64_t ir1 = iir1; ir1 < iir1 + blck_1 && ir1 < ir1_end; ++ir1) {
@@ -1677,8 +1685,21 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
 
                 float * dst_col = (float *) ((char *) dst->data + (i1*nb1 + i2*nb2));
 
-                for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir0_end; ++ir0) {
-                    vec_dot(ne00, &tmp[ir0 - iir0], 0, src0_cur + ir0*nb01, 0, src1_col, 0, 1);
+                if (type == GGML_TYPE_I2_S) {
+                    // I2_S: use nb01/4 addressing and post-process with act_scales/act_sums
+                    // scale is at the end of each expert slice
+                    const float * i2s_scale = (const float *)(src0_cur + ne00 * ne01 / 4);
+                    const char * src1_col_de = (const char *)wdata + (i11 * nb11 / 4);
+                    for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir0_end; ++ir0) {
+                        vec_dot(ne00, &tmp[ir0 - iir0], 0,
+                            src0_cur + ir0 * nb01 / 4, 0,
+                            src1_col_de, 0, 1);
+                        tmp[ir0 - iir0] = (tmp[ir0 - iir0] - i2s_act_sums[i11]) / (i2s_act_scales[i11]) * (*i2s_scale);
+                    }
+                } else {
+                    for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir0_end; ++ir0) {
+                        vec_dot(ne00, &tmp[ir0 - iir0], 0, src0_cur + ir0*nb01, 0, src1_col, 0, 1);
+                    }
                 }
 
                 memcpy(&dst_col[iir0], tmp, (MIN(iir0 + blck_0, ir0_end) - iir0)*sizeof(float));
@@ -1732,7 +1753,12 @@ static void ggml_compute_forward_mul_mat_id(
     void * wdata_cur = params->wdata;
 
     if (src1->type != vec_dot_type) {
-        incr_ptr_aligned(&wdata_cur, ggml_row_size(vec_dot_type, ggml_nelements(src1)), sizeof(int64_t));
+        size_t src1_quant_size = ggml_row_size(vec_dot_type, ggml_nelements(src1));
+        if (vec_dot_type == GGML_TYPE_I8_S) {
+            // I2_S: also skip act_scales and act_sums stored after quantized data
+            src1_quant_size += ne11 * sizeof(float) + ne11 * sizeof(int32_t);
+        }
+        incr_ptr_aligned(&wdata_cur, src1_quant_size, sizeof(int64_t));
     }
 
     int64_t * matrix_row_counts = // [n_as]
@@ -1757,30 +1783,35 @@ static void ggml_compute_forward_mul_mat_id(
         assert(params->wsize >= ne13*nbw3);
         GGML_ASSERT(src1->type == GGML_TYPE_F32);
 
-#if 0
-        for (int64_t i13 = 0; i13 < ne13; ++i13) {
-            for (int64_t i12 = ith; i12 < ne12; i12 += nth) {
-                for (int64_t i11 = 0; i11 < ne11; ++i11) {
-                    from_float((float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11),
-                               (void *)               (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1),
-                               ne10);
+        if (src0->type == GGML_TYPE_I2_S) {
+            // I2_S: use quantize_row_i8_s with per-column act_scales and act_sums
+            float   * act_scales = (float *)   (wdata + ne11 * ne10);
+            int32_t * act_sums   = (int32_t *) ((char *)act_scales + ne11 * sizeof(float));
+
+            for (int64_t i13 = 0; i13 < ne13; ++i13) {
+                for (int64_t i12 = 0; i12 < ne12; ++i12) {
+                    for (int64_t i11 = ith; i11 < ne11; i11 += nth) {
+                        quantize_row_i8_s(
+                            (float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11),
+                            (void *) (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1),
+                            ne10, act_scales + i11, act_sums + i11);
+                    }
+                }
+            }
+        } else {
+            for (int64_t i13 = 0; i13 < ne13; ++i13) {
+                for (int64_t i12 = 0; i12 < ne12; ++i12) {
+                    for (int64_t i11 = 0; i11 < ne11; ++i11) {
+                        size_t bs = ggml_blck_size(vec_dot_type);
+                        int64_t ne10_block_start = (ith * ne10/bs) / nth;
+                        int64_t ne10_block_end   = ((ith + 1) * ne10/bs) / nth;
+                        from_float((float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11 + ne10_block_start*bs*nb10),
+                                   (void *)               (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1 + ne10_block_start*nbw0),
+                                   (ne10_block_end - ne10_block_start) * bs);
+                    }
                 }
             }
         }
-#else
-        for (int64_t i13 = 0; i13 < ne13; ++i13) {
-            for (int64_t i12 = 0; i12 < ne12; ++i12) {
-                for (int64_t i11 = 0; i11 < ne11; ++i11) {
-                    size_t bs = ggml_blck_size(vec_dot_type);
-                    int64_t ne10_block_start = (ith * ne10/bs) / nth;
-                    int64_t ne10_block_end   = ((ith + 1) * ne10/bs) / nth;
-                    from_float((float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11 + ne10_block_start*bs*nb10),
-                               (void *)               (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1 + ne10_block_start*nbw0),
-                               (ne10_block_end - ne10_block_start) * bs);
-                }
-            }
-        }
-#endif
     }
 
     if (ith == 0) {
@@ -1815,7 +1846,14 @@ static void ggml_compute_forward_mul_mat_id(
             continue;
         }
 
-        const char * src0_cur = (const char *) src0->data + cur_a * nb02;
+        // I2_S: data is packed (4 elements per byte) + 32 bytes scale per 2D slice
+        const char * src0_cur;
+        if (type == GGML_TYPE_I2_S) {
+            const size_t i2s_slice_bytes = (size_t)ne01 * ne00 / 4 + 32;
+            src0_cur = (const char *) src0->data + cur_a * i2s_slice_bytes;
+        } else {
+            src0_cur = (const char *) src0->data + cur_a * nb02;
+        }
         const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
 
@@ -3019,7 +3057,15 @@ struct ggml_cplan ggml_graph_plan(
                         const int n_as = src0->ne[2];
                         // src1
                         if (src1->type != vec_dot_type) {
-                            cur += ggml_row_size(vec_dot_type, ggml_nelements(src1)) + sizeof(int64_t);
+                            if (vec_dot_type == GGML_TYPE_I8_S) {
+                                // I2_S needs extra space for act_scales and act_sums
+                                cur += ggml_row_size(vec_dot_type, ggml_nelements(src1))
+                                    + src1->ne[1] * sizeof(float)
+                                    + src1->ne[1] * sizeof(int32_t)
+                                    + sizeof(int64_t);
+                            } else {
+                                cur += ggml_row_size(vec_dot_type, ggml_nelements(src1)) + sizeof(int64_t);
+                            }
                         }
                         // matrix_row_counts
                         cur += n_as * sizeof(int64_t) + sizeof(int64_t);

@@ -7,11 +7,10 @@ void llama_model_bitnet::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_YOCO_U_ITERS, hparams.yoco_u_iters, false);
 
     // Read sliding window for YOCO self-decoder layers
+    // Note: n_swa is stored but swa_type is left as NONE —
+    // YOCO uses a plain KV cache; the window is only informational.
+    // Cross-decoder layers use shared KV without cache (no_cache mode).
     ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW, hparams.n_swa, false);
-
-    if (hparams.n_swa > 0) {
-        hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
-    }
 
     // MoE: read expert FFN dimension from custom key
     {
@@ -155,6 +154,9 @@ llama_model_bitnet::graph::graph(const llama_model & model, const llm_graph_para
         cur = build_norm(inpL, model.layers[il].attn_norm, NULL, LLM_NORM_RMS, il);
         cb(cur, "attn_norm", il);
 
+        // Save attn_norm output for diff_v3 gate (cur will be overwritten by build_attn)
+        ggml_tensor * cur_attn_norm = cur;
+
         // --- Attention ---
         {
             ggml_tensor * Qcur = ggml_mul_mat(ctx0, model.layers[il].wq, cur);
@@ -200,55 +202,32 @@ llama_model_bitnet::graph::graph(const llama_model & model, const llm_graph_para
                         1.0f/sqrtf(float(n_embd_head)), il);
             }
 
-            // diff_v3: gate + differential
+            // diff_v3: gate + differential attention
+            // PyTorch ref: output = output * sigmoid(gate(x)); output = output[:,0::2] - output[:,1::2]
             if (model.layers[il].wqkv_gate) {
-                // gate: sigmoid(W_gate @ norm_input) -> [n_head_il, n_tokens]
-                ggml_tensor * attn_input = build_norm(inpSA, model.layers[il].attn_norm, NULL, LLM_NORM_RMS, il);
-                ggml_tensor * gate = ggml_mul_mat(ctx0, model.layers[il].wqkv_gate, attn_input);
+                const int64_t real_heads = n_head_il / 2;
+
+                // gate: sigmoid(W_gate @ attn_norm_input) -> [n_head_il, n_tokens]
+                ggml_tensor * gate = ggml_mul_mat(ctx0, model.layers[il].wqkv_gate, cur_attn_norm);
                 gate = ggml_sigmoid(ctx0, gate);
-                // gate shape: [n_head_il, n_tokens], broadcast over head_dim
                 gate = ggml_reshape_3d(ctx0, gate, 1, n_head_il, n_tokens);
 
                 // cur from build_attn: [n_embd_head * n_head_il, n_tokens]
                 ggml_tensor * attn_3d = ggml_reshape_3d(ctx0, cur, n_embd_head, n_head_il, n_tokens);
                 attn_3d = ggml_mul(ctx0, attn_3d, gate);
+                attn_3d = ggml_cont(ctx0, attn_3d);
 
-                // Differential: output[h] = attn[2h] - attn[2h+1]
-                const int64_t real_heads = n_head_il / 2;
-                ggml_tensor * attn_cont = ggml_cont(ctx0, attn_3d);
-                // even heads: stride=2 starting at offset 0
-                ggml_tensor * even = ggml_view_3d(ctx0, attn_cont,
-                        n_embd_head, real_heads, n_tokens,
-                        attn_cont->nb[0], attn_cont->nb[1] * 2, attn_cont->nb[2]);
-                // odd heads: stride=2 starting at offset nb[1]
-                ggml_tensor * odd = ggml_view_3d(ctx0,
-                        attn_cont,
-                        n_embd_head, real_heads, n_tokens,
-                        attn_cont->nb[0], attn_cont->nb[1] * 2, attn_cont->nb[2]);
-                odd = ggml_view_3d(ctx0, attn_cont,
-                        n_embd_head, real_heads, n_tokens,
-                        attn_cont->nb[0], attn_cont->nb[1] * 2, attn_cont->nb[2]);
-                // Actually: need to offset odd by one head slot
-                // even: elements at head indices 0,2,4,...
-                // odd: elements at head indices 1,3,5,...
-                // Use a reshape trick: [head_dim, 2, real_heads, tokens] then slice dim1
-                ggml_tensor * r4d = ggml_reshape_4d(ctx0, attn_cont, n_embd_head, 2, real_heads, n_tokens);
-                even = ggml_view_4d(ctx0, r4d, n_embd_head, 1, real_heads, n_tokens,
-                        r4d->nb[0], r4d->nb[1] * 2, r4d->nb[2], r4d->nb[3]);
-                odd  = ggml_view_4d(ctx0, r4d, n_embd_head, 1, real_heads, n_tokens,
-                        r4d->nb[0], r4d->nb[1] * 2, r4d->nb[2], r4d->nb[3]);
-                // offset odd by nb[1] (one element in dim1)
-                // Actually ggml_view doesn't support offset easily, let's just use contiguous slicing
-                // Reshape: [head_dim * 2, real_heads, tokens] -> take first half and second half per group
-                ggml_tensor * r3d = ggml_reshape_3d(ctx0, attn_cont, n_embd_head * 2, real_heads, n_tokens);
-                even = ggml_view_3d(ctx0, r3d, n_embd_head, real_heads, n_tokens,
-                        r3d->nb[0] / 2, r3d->nb[1], r3d->nb[2]);  // wrong - nb is bytes not elements
+                // Differential: reshape [head_dim, 2, real_heads, tokens] to split even/odd
+                ggml_tensor * r4d = ggml_reshape_4d(ctx0, attn_3d, n_embd_head, 2, real_heads, n_tokens);
+                ggml_tensor * even = ggml_view_4d(ctx0, r4d, n_embd_head, 1, real_heads, n_tokens,
+                        r4d->nb[1], r4d->nb[2], r4d->nb[3], 0);
+                even = ggml_cont(ctx0, even);
+                ggml_tensor * odd = ggml_view_4d(ctx0, r4d, n_embd_head, 1, real_heads, n_tokens,
+                        r4d->nb[1], r4d->nb[2], r4d->nb[3], r4d->nb[1]);
+                odd = ggml_cont(ctx0, odd);
 
-                // Simplest correct approach: use ggml_get_rows or just skip diff_v3 for now
-                // and just reshape to [real_heads * head_dim, tokens] treating all as output
-                // For benchmark purposes, skip the differential and just do the gating + reshape
-                cur = ggml_reshape_2d(ctx0, attn_cont, n_head_il * n_embd_head, n_tokens);
-                // TODO: implement proper diff_v3 with custom op or ggml view offsets
+                cur = ggml_sub(ctx0, even, odd);
+                cur = ggml_reshape_2d(ctx0, cur, real_heads * n_embd_head, n_tokens);
             }
 
             cb(cur, "attn_out_pre", il);

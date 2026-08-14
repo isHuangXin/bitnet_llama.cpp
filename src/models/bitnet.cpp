@@ -309,13 +309,25 @@ llama_model_bitnet::graph::graph(const llama_model & model, const llm_graph_para
                     nullptr, nullptr, nullptr, nullptr);
             cb(moe_out, "ffn_moe_out", il);
 
-            // Shared expert
+            // Shared expert — manual SwiGLU with correct clamp-before-silu order
+            // PyTorch: silu(gate.clamp(max=limit)) * up.clamp(-limit, limit)
             if (model.layers[il].ffn_gate_shexp) {
-                ggml_tensor * ffn_shexp = build_ffn(cur,
-                        model.layers[il].ffn_up_shexp, NULL, NULL,
-                        model.layers[il].ffn_gate_shexp, NULL, NULL,
-                        model.layers[il].ffn_down_shexp, NULL, NULL,
-                        NULL, LLM_FFN_SILU, LLM_FFN_PAR, il);
+                const float shexp_limit = hparams.swiglu_clamp_shexp[il];
+
+                ggml_tensor * up_shexp   = ggml_mul_mat(ctx0, model.layers[il].ffn_up_shexp,   cur);
+                ggml_tensor * gate_shexp = ggml_mul_mat(ctx0, model.layers[il].ffn_gate_shexp, cur);
+
+                ggml_tensor * ffn_shexp;
+                if (shexp_limit > 1e-6f) {
+                    up_shexp   = ggml_clamp(ctx0, up_shexp,   -shexp_limit, shexp_limit);
+                    gate_shexp = ggml_clamp(ctx0, gate_shexp, -INFINITY,    shexp_limit);
+                    gate_shexp = ggml_silu(ctx0, gate_shexp);
+                    ffn_shexp  = ggml_mul(ctx0, gate_shexp, up_shexp);
+                } else {
+                    ffn_shexp = ggml_swiglu_split(ctx0, gate_shexp, up_shexp);
+                }
+
+                ffn_shexp = ggml_mul_mat(ctx0, model.layers[il].ffn_down_shexp, ffn_shexp);
                 cb(ffn_shexp, "ffn_shexp", il);
 
                 if (model.layers[il].ffn_gate_inp_shexp) {

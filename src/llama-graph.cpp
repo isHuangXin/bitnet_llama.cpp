@@ -2050,10 +2050,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                     if (limit > eps2) {
                         up = ggml_clamp(ctx0, up, -limit, limit);
                         cb(up, "ffn_moe_up_clamped", il);
+                        // PyTorch: silu(gate.clamp(max=limit)) — clamp BEFORE silu
+                        cur = ggml_clamp(ctx0, cur, -INFINITY, limit);
+                        cb(cur, "ffn_moe_gate_clamped", il);
                         ggml_tensor * gate_act = ggml_silu(ctx0, cur);
                         cb(gate_act, "ffn_moe_silu", il);
-                        gate_act = ggml_clamp(ctx0, gate_act, -INFINITY, limit);
-                        cb(gate_act, "ffn_moe_silu_clamped", il);
                         cur = ggml_mul(ctx0, gate_act, up);
                         cb(cur, "ffn_moe_swiglu_limited", il);
                         break;

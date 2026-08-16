@@ -29,12 +29,46 @@ void llama_model_bitnet::load_arch_hparams(llama_model_loader & ml) {
     }
 
     switch (hparams.n_layer()) {
-        case 20: type = LLM_TYPE_30B_A3B; break; // YOCO-MoE 20 layers
+        case 20:
+            if (hparams.yoco_u_iters > 1) {
+                type = LLM_TYPE_30B_A6B;  // YOCO-U-MoE: 20 stored layers, T=3 loop
+            } else {
+                type = LLM_TYPE_30B_A3B;  // YOCO-MoE: 20 layers
+            }
+            break;
         case 26: type = LLM_TYPE_3B; break;
         case 28: type = LLM_TYPE_3B; break;
         case 30: type = LLM_TYPE_2B; break;
-        case 40: type = LLM_TYPE_30B_A6B; break; // YOCO-U-MoE 40 layers
+        case 40: type = LLM_TYPE_30B_A6B; break; // YOCO-U-MoE 40 layers (unrolled format)
         default: type = LLM_TYPE_UNKNOWN;
+    }
+
+    // YOCO-U compact mode: KV cache needs T * n_self_layers slots
+    // Expand n_layer_all and head arrays to match
+    if (hparams.yoco_u_iters > 1 && hparams.n_layer() == 20) {
+        const uint32_t T = hparams.yoco_u_iters;
+        const uint32_t n_stored = hparams.n_layer();  // 20
+        const uint32_t n_self = n_stored / 2;          // 10
+        const uint32_t n_cross = n_stored - n_self;    // 10
+        const uint32_t n_effective = T * n_self + n_cross;  // 40
+
+        // Expand head count arrays: repeat self-decoder T times, then cross
+        auto orig_n_head = hparams.n_head_arr;
+        auto orig_n_head_kv = hparams.n_head_kv_arr;
+        hparams.n_head_arr.fill(0);
+        hparams.n_head_kv_arr.fill(0);
+        for (uint32_t t = 0; t < T; ++t) {
+            for (uint32_t i = 0; i < n_self; ++i) {
+                hparams.n_head_arr[t * n_self + i] = orig_n_head[i];
+                hparams.n_head_kv_arr[t * n_self + i] = orig_n_head_kv[i];
+            }
+        }
+        for (uint32_t i = 0; i < n_cross; ++i) {
+            hparams.n_head_arr[T * n_self + i] = orig_n_head[n_self + i];
+            hparams.n_head_kv_arr[T * n_self + i] = orig_n_head_kv[n_self + i];
+        }
+
+        hparams.n_layer_all = n_effective;
     }
 }
 
@@ -121,15 +155,24 @@ llama_model_bitnet::graph::graph(const llama_model & model, const llm_graph_para
     const int64_t n_expert_top_k = hparams.n_expert_used;
     const bool    has_moe        = (n_expert_count > 0);
 
-    // Determine YOCO self/cross boundary by checking for K proj
-    int n_self_layers = n_layer;
-    for (int il = 0; il < n_layer; ++il) {
+    // YOCO-U: determine stored vs effective layer counts
+    const int n_stored_layers = (int)model.layers.size();  // actual stored layers (20)
+    const int yoco_u_iters = hparams.yoco_u_iters;
+    const int n_self_stored = n_stored_layers / 2;   // 10 self layers stored
+    const int n_cross_stored = n_stored_layers - n_self_stored;  // 10 cross layers stored
+
+    // Determine YOCO self/cross boundary from stored layers
+    int n_self_layers_stored = n_stored_layers;
+    for (int il = 0; il < n_stored_layers; ++il) {
         if (model.layers[il].wk == nullptr) {
-            n_self_layers = il;
+            n_self_layers_stored = il;
             break;
         }
     }
-    const bool is_yoco = (n_self_layers < n_layer);
+    const bool is_yoco = (n_self_layers_stored < n_stored_layers);
+
+    // Effective layer count for inference (with T iterations)
+    const int n_effective = yoco_u_iters * n_self_layers_stored + (n_stored_layers - n_self_layers_stored);
 
     ggml_tensor * cur;
     ggml_tensor * inpL;
@@ -153,13 +196,25 @@ llama_model_bitnet::graph::graph(const llama_model & model, const llm_graph_para
     ggml_tensor * shared_V = nullptr;
 
     for (int il = 0; il < n_layer; ++il) {
+        // Map effective layer index to stored layer index
+        int il_stored;
+        bool is_cross_layer;
+        if (il < yoco_u_iters * n_self_layers_stored) {
+            // Self-decoder pass: il_stored cycles through 0..n_self_stored-1
+            il_stored = il % n_self_layers_stored;
+            is_cross_layer = false;
+        } else {
+            // Cross-decoder: offset into cross layers
+            il_stored = n_self_layers_stored + (il - yoco_u_iters * n_self_layers_stored);
+            is_cross_layer = true;
+        }
+
         ggml_tensor * inpSA = inpL;
 
         const int64_t n_head_il    = hparams.n_head(il);
         const int64_t n_head_kv_il = hparams.n_head_kv(il);
-        const bool is_cross_layer  = (il >= n_self_layers);
 
-        cur = build_norm(inpL, model.layers[il].attn_norm, NULL, LLM_NORM_RMS, il);
+        cur = build_norm(inpL, model.layers[il_stored].attn_norm, NULL, LLM_NORM_RMS, il);
         cb(cur, "attn_norm", il);
 
         // Save attn_norm output for diff_v3 gate (cur will be overwritten by build_attn)
@@ -167,14 +222,14 @@ llama_model_bitnet::graph::graph(const llama_model & model, const llm_graph_para
 
         // --- Attention ---
         {
-            ggml_tensor * Qcur = ggml_mul_mat(ctx0, model.layers[il].wq, cur);
+            ggml_tensor * Qcur = ggml_mul_mat(ctx0, model.layers[il_stored].wq, cur);
 
             // Reshape Q to 3D [head_dim, n_head, n_tokens] BEFORE RMS-clip
             // so that RMS-clip operates per-head (matching PyTorch which does
             // mean(dim=-1) over head_dim after view(n_tokens, n_head, head_dim))
             Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head_il, n_tokens);
 
-            if (model.layers[il].attn_q_norm) {
+            if (model.layers[il_stored].attn_q_norm) {
                 // RMS-clip per head: result = x * min(limit/rms, 1.0) * weight
                 // Uses ggml_rms_norm (single fused kernel for per-head RMS normalization)
                 // then conditional selection: take scaled when rms > limit, else take x
@@ -187,19 +242,19 @@ llama_model_bitnet::graph::graph(const llama_model & model, const llm_graph_para
                 ggml_tensor * mask   = ggml_step(ctx0, ggml_mul(ctx0, Qcur, diff)); // 1 when rms>limit
                 Qcur = ggml_sub(ctx0, Qcur, ggml_mul(ctx0, diff, mask));          // x or scaled
                 // apply per-element weight
-                ggml_tensor * q_norm_3d = ggml_reshape_3d(ctx0, model.layers[il].attn_q_norm, n_embd_head, n_head_il, 1);
+                ggml_tensor * q_norm_3d = ggml_reshape_3d(ctx0, model.layers[il_stored].attn_q_norm, n_embd_head, n_head_il, 1);
                 Qcur = ggml_mul(ctx0, Qcur, q_norm_3d);
             }
 
             if (!is_cross_layer) {
                 // Self-decoder
-                ggml_tensor * Kcur = ggml_mul_mat(ctx0, model.layers[il].wk, cur);
-                ggml_tensor * Vcur = ggml_mul_mat(ctx0, model.layers[il].wv, cur);
+                ggml_tensor * Kcur = ggml_mul_mat(ctx0, model.layers[il_stored].wk, cur);
+                ggml_tensor * Vcur = ggml_mul_mat(ctx0, model.layers[il_stored].wv, cur);
 
                 // Reshape K to 3D before RMS-clip (per-head normalization)
                 Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv_il, n_tokens);
 
-                if (model.layers[il].attn_k_norm) {
+                if (model.layers[il_stored].attn_k_norm) {
                     const float qk_rms_limit = 3.0f;
                     const float eps = hparams.f_norm_rms_eps;
 
@@ -208,7 +263,7 @@ llama_model_bitnet::graph::graph(const llama_model & model, const llm_graph_para
                     ggml_tensor * k_diff   = ggml_sub(ctx0, Kcur, k_scaled);
                     ggml_tensor * k_mask   = ggml_step(ctx0, ggml_mul(ctx0, Kcur, k_diff));
                     Kcur = ggml_sub(ctx0, Kcur, ggml_mul(ctx0, k_diff, k_mask));
-                    ggml_tensor * k_norm_3d = ggml_reshape_3d(ctx0, model.layers[il].attn_k_norm, n_embd_head, n_head_kv_il, 1);
+                    ggml_tensor * k_norm_3d = ggml_reshape_3d(ctx0, model.layers[il_stored].attn_k_norm, n_embd_head, n_head_kv_il, 1);
                     Kcur = ggml_mul(ctx0, Kcur, k_norm_3d);
                 }
                 Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv_il, n_tokens);
@@ -238,11 +293,11 @@ llama_model_bitnet::graph::graph(const llama_model & model, const llm_graph_para
 
             // diff_v3: gate + differential attention
             // PyTorch ref: output = output * sigmoid(gate(x)); output = output[:,0::2] - output[:,1::2]
-            if (model.layers[il].wqkv_gate) {
+            if (model.layers[il_stored].wqkv_gate) {
                 const int64_t real_heads = n_head_il / 2;
 
                 // gate: sigmoid(W_gate @ attn_norm_input) -> [n_head_il, n_tokens]
-                ggml_tensor * gate = ggml_mul_mat(ctx0, model.layers[il].wqkv_gate, cur_attn_norm);
+                ggml_tensor * gate = ggml_mul_mat(ctx0, model.layers[il_stored].wqkv_gate, cur_attn_norm);
                 gate = ggml_sigmoid(ctx0, gate);
                 gate = ggml_reshape_3d(ctx0, gate, 1, n_head_il, n_tokens);
 
@@ -265,7 +320,7 @@ llama_model_bitnet::graph::graph(const llama_model & model, const llm_graph_para
             }
 
             cb(cur, "attn_out_pre", il);
-            cur = ggml_mul_mat(ctx0, model.layers[il].wo, cur);
+            cur = ggml_mul_mat(ctx0, model.layers[il_stored].wo, cur);
             cb(cur, "attn_out", il);
         }
 
@@ -278,31 +333,31 @@ llama_model_bitnet::graph::graph(const llama_model & model, const llm_graph_para
         cb(ffn_inp, "ffn_inp", il);
 
         // --- FFN ---
-        cur = build_norm(ffn_inp, model.layers[il].ffn_norm, NULL, LLM_NORM_RMS, il);
+        cur = build_norm(ffn_inp, model.layers[il_stored].ffn_norm, NULL, LLM_NORM_RMS, il);
         cb(cur, "ffn_norm", il);
 
         if (has_moe) {
             ggml_tensor * moe_out = build_moe_ffn(cur,
-                    model.layers[il].ffn_gate_inp,
+                    model.layers[il_stored].ffn_gate_inp,
                     nullptr, nullptr,
-                    model.layers[il].ffn_down_exps,
+                    model.layers[il_stored].ffn_down_exps,
                     nullptr,
                     n_expert_count, n_expert_top_k,
                     LLM_FFN_SILU, true, 0.0f,
                     LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX,
                     il,
                     nullptr,
-                    model.layers[il].ffn_gate_up_exps,
+                    model.layers[il_stored].ffn_gate_up_exps,
                     nullptr, nullptr, nullptr, nullptr);
             cb(moe_out, "ffn_moe_out", il);
 
             // Shared expert — manual SwiGLU with correct clamp-before-silu order
             // PyTorch: silu(gate.clamp(max=limit)) * up.clamp(-limit, limit)
-            if (model.layers[il].ffn_gate_shexp) {
+            if (model.layers[il_stored].ffn_gate_shexp) {
                 const float shexp_limit = hparams.swiglu_clamp_shexp[il];
 
-                ggml_tensor * up_shexp   = ggml_mul_mat(ctx0, model.layers[il].ffn_up_shexp,   cur);
-                ggml_tensor * gate_shexp = ggml_mul_mat(ctx0, model.layers[il].ffn_gate_shexp, cur);
+                ggml_tensor * up_shexp   = ggml_mul_mat(ctx0, model.layers[il_stored].ffn_up_shexp,   cur);
+                ggml_tensor * gate_shexp = ggml_mul_mat(ctx0, model.layers[il_stored].ffn_gate_shexp, cur);
 
                 ggml_tensor * ffn_shexp;
                 if (shexp_limit > 1e-6f) {
@@ -314,11 +369,11 @@ llama_model_bitnet::graph::graph(const llama_model & model, const llm_graph_para
                     ffn_shexp = ggml_swiglu_split(ctx0, gate_shexp, up_shexp);
                 }
 
-                ffn_shexp = ggml_mul_mat(ctx0, model.layers[il].ffn_down_shexp, ffn_shexp);
+                ffn_shexp = ggml_mul_mat(ctx0, model.layers[il_stored].ffn_down_shexp, ffn_shexp);
                 cb(ffn_shexp, "ffn_shexp", il);
 
-                if (model.layers[il].ffn_gate_inp_shexp) {
-                    ggml_tensor * sg = ggml_mul_mat(ctx0, model.layers[il].ffn_gate_inp_shexp, cur);
+                if (model.layers[il_stored].ffn_gate_inp_shexp) {
+                    ggml_tensor * sg = ggml_mul_mat(ctx0, model.layers[il_stored].ffn_gate_inp_shexp, cur);
                     sg = ggml_sigmoid(ctx0, sg);
                     ffn_shexp = ggml_mul(ctx0, ffn_shexp, sg);
                 }
@@ -329,9 +384,9 @@ llama_model_bitnet::graph::graph(const llama_model & model, const llm_graph_para
             cb(cur, "ffn_out", il);
         } else {
             cur = build_ffn(cur,
-                    model.layers[il].ffn_up,   NULL, NULL,
-                    model.layers[il].ffn_gate, NULL, NULL,
-                    model.layers[il].ffn_down, NULL, NULL,
+                    model.layers[il_stored].ffn_up,   NULL, NULL,
+                    model.layers[il_stored].ffn_gate, NULL, NULL,
+                    model.layers[il_stored].ffn_down, NULL, NULL,
                     NULL, LLM_FFN_SILU, LLM_FFN_PAR, il);
             cb(cur, "ffn_out", il);
         }
@@ -344,8 +399,8 @@ llama_model_bitnet::graph::graph(const llama_model & model, const llm_graph_para
         inpL = cur;
 
         // Compute shared KV after self-decoder
-        if (is_yoco && il == n_self_layers - 1 && model.yoco_cross_kv_norm) {
-            const int64_t n_head_kv_cross = hparams.n_head_kv(n_self_layers);
+        if (is_yoco && il == yoco_u_iters * n_self_layers_stored - 1 && model.yoco_cross_kv_norm) {
+            const int64_t n_head_kv_cross = hparams.n_head_kv(yoco_u_iters * n_self_layers_stored);
 
             ggml_tensor * normed = build_norm(inpL, model.yoco_cross_kv_norm, NULL, LLM_NORM_RMS, -1);
 

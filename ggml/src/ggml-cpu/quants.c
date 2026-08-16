@@ -1333,6 +1333,10 @@ void quantize_row_i8_s_4x1(const float * x, void * y, int64_t n, float* act_scal
 }
 
 void dequantize_row_i2_s(const uint8_t * x, float * y, int64_t n, const float i2_scale) {
+    // n = total elements in tensor (M * K), i2_scale is ignored for per-row mode
+    // Per-row scales are stored after packed ternary bytes at x + n/4
+    // But this function is called with a single scale for backward compat.
+    // When called from TL2 path, scale is applied in the kernel, not here.
     static const float map2bit[4] = { -1.0f, 0.0f, 1.0f, 0.0f };
     int64_t done = 0;
     while (done < n) {
@@ -1359,31 +1363,87 @@ size_t quantize_i2_s(const float * src, void * dst, int64_t nrow, int64_t n_per_
     (void)quant_weights;
     int64_t n = nrow * n_per_row;
 
-    double max = 0.0;
-    for (int64_t i = 0; i < n; i++) {
-        double v = fabs((double)src[i]);
-        if (v > max) { max = v; break; }  // first nonzero abs as scale (BitNet convention)
+    // Check environment variable for per-row mode (default: legacy per-tensor for backward compat)
+    static int per_row_mode = -1;
+    if (per_row_mode < 0) {
+        const char * env = getenv("BITNET_I2S_PER_ROW");
+        per_row_mode = (env != NULL && atoi(env) != 0) ? 1 : 0;  // default OFF
     }
 
     uint8_t * q = (uint8_t *)dst;
     memset(q, 0, n / 4);
 
-    for (int64_t i = 0; i < n; i++) {
-        uint8_t val;
-        if (fabs((double)src[i]) < 1e-6) {
-            val = 1; // maps to 0
-        } else {
-            val = ((double)src[i] * max > 0) ? 2 : 0; // maps to +1 or -1
+    if (per_row_mode) {
+        // Per-row TernarySEQ quantization
+        for (int64_t row = 0; row < nrow; row++) {
+            const float * row_src = src + row * n_per_row;
+
+            double row_max = 1e-5;
+            for (int64_t j = 0; j < n_per_row; j++) {
+                double v = fabs((double)row_src[j]);
+                if (v > row_max) row_max = v;
+            }
+
+            double inv_alpha = 1.0 / row_max;
+            double clip_ratio = 1.0 - 1e-2;
+            for (int64_t j = 0; j < n_per_row; j++) {
+                int64_t idx = row * n_per_row + j;
+                double val = (double)row_src[j] * inv_alpha;
+                if (val > clip_ratio) val = clip_ratio;
+                if (val < -clip_ratio) val = -clip_ratio;
+                int t = (int)round(val * 1.5);
+                if (t > 1) t = 1;
+                if (t < -1) t = -1;
+
+                uint8_t enc = (t == -1) ? 0 : (t == 0) ? 1 : 2;
+                int byte_idx = idx / 4;
+                int bit_pos = 6 - 2 * (idx % 4);
+                q[byte_idx] |= (enc << bit_pos);
+            }
         }
-        int byte_idx = i / 4;
-        int bit_pos = 6 - 2 * (i % 4);
-        q[byte_idx] |= (val << bit_pos);
+
+        // Store per-row scales (M floats)
+        float * scale_ptr = (float *)(q + n / 4);
+        for (int64_t row = 0; row < nrow; row++) {
+            const float * row_src = src + row * n_per_row;
+            double row_max = 1e-5;
+            for (int64_t j = 0; j < n_per_row; j++) {
+                double v = fabs((double)row_src[j]);
+                if (v > row_max) row_max = v;
+            }
+            scale_ptr[row] = (float)row_max;
+        }
+
+        int64_t scales_bytes = nrow * (int64_t)sizeof(float);
+        int64_t total = n / 4 + scales_bytes;
+        if (total % 32 != 0) total = total + (32 - total % 32);
+        return (size_t)total;
+
+    } else {
+        // Legacy per-tensor quantization
+        double max = 0.0;
+        for (int64_t i = 0; i < n; i++) {
+            double v = fabs((double)src[i]);
+            if (v > max) { max = v; break; }
+        }
+
+        for (int64_t i = 0; i < n; i++) {
+            uint8_t val;
+            if (fabs((double)src[i]) < 1e-6) {
+                val = 1;
+            } else {
+                val = ((double)src[i] * max > 0) ? 2 : 0;
+            }
+            int byte_idx = i / 4;
+            int bit_pos = 6 - 2 * (i % 4);
+            q[byte_idx] |= (val << bit_pos);
+        }
+
+        float * scale_ptr = (float *)(q + n / 4);
+        scale_ptr[0] = (float)max;
+
+        return nrow * n_per_row / 4 + 32;
     }
-
-    float * scale_ptr = (float *)(q + n / 4);
-    scale_ptr[0] = (float)max;
-
-    return nrow * n_per_row / 4 + 32;
 }
 
 

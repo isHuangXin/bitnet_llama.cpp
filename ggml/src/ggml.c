@@ -7822,8 +7822,8 @@ size_t ggml_quantize_chunk(
     }
 
     if (type == GGML_TYPE_I2_S) {
-        // I2_S packs 4 elements per byte + 32 bytes header
-        GGML_ASSERT(result == nrows * row_size / 4 + 32);
+        // I2_S: per-row mode or legacy mode, just check result is reasonable
+        GGML_ASSERT(result >= (size_t)(nrows * row_size / 4 + 32));
     } else {
         GGML_ASSERT(result == nrows * row_size);
     }

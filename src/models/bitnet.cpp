@@ -29,11 +29,11 @@ void llama_model_bitnet::load_arch_hparams(llama_model_loader & ml) {
     }
 
     switch (hparams.n_layer()) {
-        case 20: type = LLM_TYPE_UNKNOWN; break; // YOCO-MoE 20 layers
+        case 20: type = LLM_TYPE_30B_A3B; break; // YOCO-MoE 20 layers
         case 26: type = LLM_TYPE_3B; break;
         case 28: type = LLM_TYPE_3B; break;
         case 30: type = LLM_TYPE_2B; break;
-        case 40: type = LLM_TYPE_UNKNOWN; break; // YOCO-U-MoE 40 layers
+        case 40: type = LLM_TYPE_30B_A6B; break; // YOCO-U-MoE 40 layers
         default: type = LLM_TYPE_UNKNOWN;
     }
 }

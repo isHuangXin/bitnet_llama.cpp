@@ -484,6 +484,7 @@ extern "C" {
         GGML_OP_DUP,
         GGML_OP_ADD,
         GGML_OP_ADD_ID,
+        GGML_OP_MUL_ID,
         GGML_OP_ADD1,
         GGML_OP_ACC,
         GGML_OP_SUB,
@@ -906,6 +907,17 @@ extern "C" {
 
     // dst[i0, i1, i2] = a[i0, i1, i2] + b[i0, ids[i1, i2]]
     GGML_API struct ggml_tensor * ggml_add_id(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * ids);
+
+    // element-wise multiply with expert selection (like add_id but multiply)
+    // a: [ne0, n_expert_used, n_tokens]
+    // b: [ne0, n_expert] (per-expert scale)
+    // ids: [n_expert_used, n_tokens] (selected expert indices)
+    // result: a[i,j,k] * b[i, ids[j,k]]
+    GGML_API struct ggml_tensor * ggml_mul_id(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             struct ggml_tensor  * b,

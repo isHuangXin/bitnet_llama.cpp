@@ -1811,7 +1811,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * up_exps_s,
          ggml_tensor * gate_exps_s,
          ggml_tensor * down_exps_s,
-         ggml_tensor * selected_experts_in) const {
+         ggml_tensor * selected_experts_in,
+         ggml_tensor * gate_up_act_scale,
+         ggml_tensor * gate_up_act_bias,
+         ggml_tensor * down_act_scale,
+         ggml_tensor * down_act_bias) const {
+    // Per-expert ADP8 scale/bias params (used after routing below)
     const int64_t n_embd   = cur->ne[0];
     const int64_t n_tokens = cur->ne[1];
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
@@ -1953,6 +1958,22 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
 
+    // Per-expert ADP8 for gate_up input: apply x*scale+bias per expert
+    // gate_up_act_scale: [n_embd, n_expert], gate_up_act_bias: [n_embd, n_expert]
+    // This transforms cur from [n_embd, 1, n_tokens] to [n_embd, n_expert_used, n_tokens]
+    // with per-expert affine applied, then we use ggml_mul_mat_id on the transformed input.
+    ggml_tensor * cur_for_gate_up = cur;
+    if (gate_up_act_scale) {
+        // Replicate cur to [n_embd, n_expert_used, n_tokens]
+        ggml_tensor * cur_rep = ggml_repeat_4d(ctx0, cur, n_embd, n_expert_used, n_tokens, 1);
+        // Apply per-expert scale: mul_id selects scale[:,ids[j,t]] for each (j,t)
+        cur_for_gate_up = ggml_mul_id(ctx0, cur_rep, gate_up_act_scale, selected_experts);
+        if (gate_up_act_bias) {
+            cur_for_gate_up = ggml_add_id(ctx0, cur_for_gate_up, gate_up_act_bias, selected_experts);
+        }
+        cb(cur_for_gate_up, "ffn_moe_adp8_gate_up", il);
+    }
+
     if (weight_before_ffn) {
         // repeat cur to [n_embd, n_expert_used, n_tokens]
         ggml_tensor * repeated = ggml_repeat_4d(ctx0, cur, n_embd, n_expert_used, n_tokens, 1);
@@ -1965,7 +1986,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     if (gate_up_exps) {
         // merged gate_up path: one mul_mat_id, then split into gate and up views
-        ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, selected_experts, up_exps_s); // [n_ff*2, n_expert_used, n_tokens]
+        ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, gate_up_act_scale ? cur_for_gate_up : cur, selected_experts, up_exps_s); // [n_ff*2, n_expert_used, n_tokens]
         cb(gate_up, "ffn_moe_gate_up", il);
 
         if (up_exps_s) {
@@ -2101,6 +2122,15 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             } break;
         default:
             GGML_ABORT("fatal error");
+    }
+
+    // Per-expert ADP8 for down input
+    if (down_act_scale) {
+        cur = ggml_mul_id(ctx0, cur, down_act_scale, selected_experts);
+        if (down_act_bias) {
+            cur = ggml_add_id(ctx0, cur, down_act_bias, selected_experts);
+        }
+        cb(cur, "ffn_moe_adp8_down", il);
     }
 
     experts = build_lora_mm_id(down_exps, cur, selected_experts, down_exps_s); // [n_embd, n_expert_used, n_tokens]

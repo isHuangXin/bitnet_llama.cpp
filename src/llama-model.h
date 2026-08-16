@@ -249,6 +249,18 @@ struct llama_layer {
     struct ggml_tensor * ffn_up_norm_in   = nullptr;
     struct ggml_tensor * ffn_down_norm_in = nullptr;
 
+    // BitNet ADP8 activation quantization (act_scale, act_bias per projection)
+    struct ggml_tensor * attn_q_act_scale = nullptr;
+    struct ggml_tensor * attn_q_act_bias  = nullptr;
+    struct ggml_tensor * attn_k_act_scale = nullptr;
+    struct ggml_tensor * attn_k_act_bias  = nullptr;
+    struct ggml_tensor * attn_v_act_scale = nullptr;
+    struct ggml_tensor * attn_v_act_bias  = nullptr;
+    struct ggml_tensor * attn_out_act_scale = nullptr;
+    struct ggml_tensor * attn_out_act_bias  = nullptr;
+    struct ggml_tensor * attn_gate_act_scale = nullptr;
+    struct ggml_tensor * attn_gate_act_bias  = nullptr;
+
     struct ggml_tensor * attn_norm_cross = nullptr;
     struct ggml_tensor * attn_norm_enc   = nullptr;
     struct ggml_tensor * ssm_norm        = nullptr;
@@ -314,6 +326,12 @@ struct llama_layer {
     struct ggml_tensor * ffn_down_exps     = nullptr;
     struct ggml_tensor * ffn_up_exps       = nullptr;
     struct ggml_tensor * ffn_gate_up_exps  = nullptr;
+
+    // ADP8 activation quantization for MoE experts
+    struct ggml_tensor * ffn_gate_up_exps_act_scale = nullptr;
+    struct ggml_tensor * ffn_gate_up_exps_act_bias  = nullptr;
+    struct ggml_tensor * ffn_down_exps_act_scale    = nullptr;
+    struct ggml_tensor * ffn_down_exps_act_bias     = nullptr;
     struct ggml_tensor * ffn_gate_inp_b    = nullptr;
     struct ggml_tensor * ffn_gate_exps_b   = nullptr;
     struct ggml_tensor * ffn_down_exps_b   = nullptr;
@@ -334,6 +352,12 @@ struct llama_layer {
     struct ggml_tensor * ffn_gate_shexp     = nullptr;
     struct ggml_tensor * ffn_down_shexp     = nullptr;
     struct ggml_tensor * ffn_up_shexp       = nullptr;
+
+    // ADP8 activation quantization for shared expert
+    struct ggml_tensor * ffn_shexp_gate_up_act_scale = nullptr;
+    struct ggml_tensor * ffn_shexp_gate_up_act_bias  = nullptr;
+    struct ggml_tensor * ffn_shexp_down_act_scale    = nullptr;
+    struct ggml_tensor * ffn_shexp_down_act_bias     = nullptr;
 
     // ff adjugate experts (chexps)
     struct ggml_tensor * ffn_gate_chexps     = nullptr;

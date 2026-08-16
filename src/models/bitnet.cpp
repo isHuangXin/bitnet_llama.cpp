@@ -7,10 +7,14 @@ void llama_model_bitnet::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_YOCO_U_ITERS, hparams.yoco_u_iters, false);
 
     // Read sliding window for YOCO self-decoder layers
-    // Note: n_swa is stored but swa_type is left as NONE —
-    // YOCO uses a plain KV cache; the window is only informational.
-    // Cross-decoder layers use shared KV without cache (no_cache mode).
+    // YOCO uses sliding window attention (window_size=512) for self-decoder layers
+    // Cross-decoder layers use shared KV (no_cache mode) - SWA doesn't apply to them
     ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW, hparams.n_swa, false);
+    if (hparams.n_swa > 0) {
+        hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
+        // Mark all layers as SWA (cross-decoder uses no_cache so mask is irrelevant)
+        hparams.set_swa_pattern(0);
+    }
 
     // MoE: read expert FFN dimension from custom key
     {
@@ -113,6 +117,18 @@ void llama_model_bitnet::load_arch_tensors(llama_model_loader &) {
         layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", i), {q_dim_i}, TENSOR_NOT_REQUIRED);
         layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", i), {kv_dim_i}, TENSOR_NOT_REQUIRED);
 
+        // ADP8 activation quantization scale/bias
+        layer.attn_q_act_scale = create_tensor(tn(LLM_TENSOR_ATTN_Q_ACT_SCALE, "weight", i), {n_embd}, TENSOR_NOT_REQUIRED);
+        layer.attn_q_act_bias  = create_tensor(tn(LLM_TENSOR_ATTN_Q_ACT_BIAS,  "weight", i), {n_embd}, TENSOR_NOT_REQUIRED);
+        layer.attn_k_act_scale = create_tensor(tn(LLM_TENSOR_ATTN_K_ACT_SCALE, "weight", i), {n_embd}, TENSOR_NOT_REQUIRED);
+        layer.attn_k_act_bias  = create_tensor(tn(LLM_TENSOR_ATTN_K_ACT_BIAS,  "weight", i), {n_embd}, TENSOR_NOT_REQUIRED);
+        layer.attn_v_act_scale = create_tensor(tn(LLM_TENSOR_ATTN_V_ACT_SCALE, "weight", i), {n_embd}, TENSOR_NOT_REQUIRED);
+        layer.attn_v_act_bias  = create_tensor(tn(LLM_TENSOR_ATTN_V_ACT_BIAS,  "weight", i), {n_embd}, TENSOR_NOT_REQUIRED);
+        layer.attn_out_act_scale = create_tensor(tn(LLM_TENSOR_ATTN_OUT_ACT_SCALE, "weight", i), {n_head_i / 2 * n_embd_head_k}, TENSOR_NOT_REQUIRED);
+        layer.attn_out_act_bias  = create_tensor(tn(LLM_TENSOR_ATTN_OUT_ACT_BIAS,  "weight", i), {n_head_i / 2 * n_embd_head_k}, TENSOR_NOT_REQUIRED);
+        layer.attn_gate_act_scale = create_tensor(tn(LLM_TENSOR_ATTN_GATE_ACT_SCALE, "weight", i), {n_embd}, TENSOR_NOT_REQUIRED);
+        layer.attn_gate_act_bias  = create_tensor(tn(LLM_TENSOR_ATTN_GATE_ACT_BIAS,  "weight", i), {n_embd}, TENSOR_NOT_REQUIRED);
+
         // FFN norm
         layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, 0);
 
@@ -122,11 +138,23 @@ void llama_model_bitnet::load_arch_tensors(llama_model_loader &) {
             layer.ffn_gate_up_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "weight", i), {n_embd, 2 * n_ff_exp, n_expert}, TENSOR_NOT_REQUIRED);
             layer.ffn_down_exps    = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp, n_embd, n_expert}, 0);
 
+            // ADP8 for MoE experts
+            layer.ffn_gate_up_exps_act_scale = create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS_ACT_SCALE, "weight", i), {n_embd, n_expert}, TENSOR_NOT_REQUIRED);
+            layer.ffn_gate_up_exps_act_bias  = create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS_ACT_BIAS, "weight", i), {n_embd, n_expert}, TENSOR_NOT_REQUIRED);
+            layer.ffn_down_exps_act_scale    = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS_ACT_SCALE, "weight", i), {n_ff_exp, n_expert}, TENSOR_NOT_REQUIRED);
+            layer.ffn_down_exps_act_bias     = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS_ACT_BIAS, "weight", i), {n_ff_exp, n_expert}, TENSOR_NOT_REQUIRED);
+
             // Shared expert
             layer.ffn_gate_shexp     = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", i), {n_embd, n_ff_exp}, TENSOR_NOT_REQUIRED);
             layer.ffn_up_shexp       = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,   "weight", i), {n_embd, n_ff_exp}, TENSOR_NOT_REQUIRED);
             layer.ffn_down_shexp     = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP, "weight", i), {n_ff_exp, n_embd}, TENSOR_NOT_REQUIRED);
             layer.ffn_gate_inp_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP_SHEXP, "weight", i), {n_embd, 1}, TENSOR_NOT_REQUIRED);
+
+            // ADP8 for shared expert
+            layer.ffn_shexp_gate_up_act_scale = create_tensor(tn(LLM_TENSOR_FFN_SHEXP_GATE_UP_ACT_SCALE, "weight", i), {n_embd}, TENSOR_NOT_REQUIRED);
+            layer.ffn_shexp_gate_up_act_bias  = create_tensor(tn(LLM_TENSOR_FFN_SHEXP_GATE_UP_ACT_BIAS, "weight", i), {n_embd}, TENSOR_NOT_REQUIRED);
+            layer.ffn_shexp_down_act_scale    = create_tensor(tn(LLM_TENSOR_FFN_SHEXP_DOWN_ACT_SCALE, "weight", i), {n_ff_exp}, TENSOR_NOT_REQUIRED);
+            layer.ffn_shexp_down_act_bias     = create_tensor(tn(LLM_TENSOR_FFN_SHEXP_DOWN_ACT_BIAS, "weight", i), {n_ff_exp}, TENSOR_NOT_REQUIRED);
         } else {
             // Dense FFN
             layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd, n_ff}, 0);
@@ -222,7 +250,15 @@ llama_model_bitnet::graph::graph(const llama_model & model, const llm_graph_para
 
         // --- Attention ---
         {
-            ggml_tensor * Qcur = ggml_mul_mat(ctx0, model.layers[il_stored].wq, cur);
+            // ADP8 activation quantization: x_q = x * act_scale + act_bias
+            ggml_tensor * cur_q = cur;
+            if (model.layers[il_stored].attn_q_act_scale) {
+                cur_q = ggml_mul(ctx0, cur, model.layers[il_stored].attn_q_act_scale);
+                if (model.layers[il_stored].attn_q_act_bias) {
+                    cur_q = ggml_add(ctx0, cur_q, model.layers[il_stored].attn_q_act_bias);
+                }
+            }
+            ggml_tensor * Qcur = ggml_mul_mat(ctx0, model.layers[il_stored].wq, cur_q);
 
             // Reshape Q to 3D [head_dim, n_head, n_tokens] BEFORE RMS-clip
             // so that RMS-clip operates per-head (matching PyTorch which does
@@ -248,8 +284,22 @@ llama_model_bitnet::graph::graph(const llama_model & model, const llm_graph_para
 
             if (!is_cross_layer) {
                 // Self-decoder
-                ggml_tensor * Kcur = ggml_mul_mat(ctx0, model.layers[il_stored].wk, cur);
-                ggml_tensor * Vcur = ggml_mul_mat(ctx0, model.layers[il_stored].wv, cur);
+                ggml_tensor * cur_k = cur;
+                if (model.layers[il_stored].attn_k_act_scale) {
+                    cur_k = ggml_mul(ctx0, cur, model.layers[il_stored].attn_k_act_scale);
+                    if (model.layers[il_stored].attn_k_act_bias) {
+                        cur_k = ggml_add(ctx0, cur_k, model.layers[il_stored].attn_k_act_bias);
+                    }
+                }
+                ggml_tensor * cur_v = cur;
+                if (model.layers[il_stored].attn_v_act_scale) {
+                    cur_v = ggml_mul(ctx0, cur, model.layers[il_stored].attn_v_act_scale);
+                    if (model.layers[il_stored].attn_v_act_bias) {
+                        cur_v = ggml_add(ctx0, cur_v, model.layers[il_stored].attn_v_act_bias);
+                    }
+                }
+                ggml_tensor * Kcur = ggml_mul_mat(ctx0, model.layers[il_stored].wk, cur_k);
+                ggml_tensor * Vcur = ggml_mul_mat(ctx0, model.layers[il_stored].wv, cur_v);
 
                 // Reshape K to 3D before RMS-clip (per-head normalization)
                 Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv_il, n_tokens);
@@ -297,7 +347,14 @@ llama_model_bitnet::graph::graph(const llama_model & model, const llm_graph_para
                 const int64_t real_heads = n_head_il / 2;
 
                 // gate: sigmoid(W_gate @ attn_norm_input) -> [n_head_il, n_tokens]
-                ggml_tensor * gate = ggml_mul_mat(ctx0, model.layers[il_stored].wqkv_gate, cur_attn_norm);
+                ggml_tensor * gate_input = cur_attn_norm;
+                if (model.layers[il_stored].attn_gate_act_scale) {
+                    gate_input = ggml_mul(ctx0, cur_attn_norm, model.layers[il_stored].attn_gate_act_scale);
+                    if (model.layers[il_stored].attn_gate_act_bias) {
+                        gate_input = ggml_add(ctx0, gate_input, model.layers[il_stored].attn_gate_act_bias);
+                    }
+                }
+                ggml_tensor * gate = ggml_mul_mat(ctx0, model.layers[il_stored].wqkv_gate, gate_input);
                 gate = ggml_sigmoid(ctx0, gate);
                 gate = ggml_reshape_3d(ctx0, gate, 1, n_head_il, n_tokens);
 
@@ -320,6 +377,13 @@ llama_model_bitnet::graph::graph(const llama_model & model, const llm_graph_para
             }
 
             cb(cur, "attn_out_pre", il);
+            // ADP8 for o_proj
+            if (model.layers[il_stored].attn_out_act_scale) {
+                cur = ggml_mul(ctx0, cur, model.layers[il_stored].attn_out_act_scale);
+                if (model.layers[il_stored].attn_out_act_bias) {
+                    cur = ggml_add(ctx0, cur, model.layers[il_stored].attn_out_act_bias);
+                }
+            }
             cur = ggml_mul_mat(ctx0, model.layers[il_stored].wo, cur);
             cb(cur, "attn_out", il);
         }
@@ -339,16 +403,29 @@ llama_model_bitnet::graph::graph(const llama_model & model, const llm_graph_para
         if (has_moe) {
             ggml_tensor * moe_out = build_moe_ffn(cur,
                     model.layers[il_stored].ffn_gate_inp,
-                    nullptr, nullptr,
+                    nullptr,  // gate_inp_b
+                    nullptr,  // up_exps
+                    nullptr,  // up_exps_b
+                    nullptr,  // gate_exps
+                    nullptr,  // gate_exps_b
                     model.layers[il_stored].ffn_down_exps,
-                    nullptr,
+                    nullptr,  // down_exps_b
+                    nullptr,  // exp_probs_b
                     n_expert_count, n_expert_top_k,
                     LLM_FFN_SILU, true, 0.0f,
                     LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX,
                     il,
-                    nullptr,
+                    nullptr,  // probs_in
                     model.layers[il_stored].ffn_gate_up_exps,
-                    nullptr, nullptr, nullptr, nullptr);
+                    nullptr,  // gate_up_exps_b
+                    nullptr,  // up_exps_s
+                    nullptr,  // gate_exps_s
+                    nullptr,  // down_exps_s
+                    nullptr,  // selected_experts_in
+                    model.layers[il_stored].ffn_gate_up_exps_act_scale,
+                    model.layers[il_stored].ffn_gate_up_exps_act_bias,
+                    model.layers[il_stored].ffn_down_exps_act_scale,
+                    model.layers[il_stored].ffn_down_exps_act_bias);
             cb(moe_out, "ffn_moe_out", il);
 
             // Shared expert — manual SwiGLU with correct clamp-before-silu order
@@ -356,8 +433,17 @@ llama_model_bitnet::graph::graph(const llama_model & model, const llm_graph_para
             if (model.layers[il_stored].ffn_gate_shexp) {
                 const float shexp_limit = hparams.swiglu_clamp_shexp[il];
 
-                ggml_tensor * up_shexp   = ggml_mul_mat(ctx0, model.layers[il_stored].ffn_up_shexp,   cur);
-                ggml_tensor * gate_shexp = ggml_mul_mat(ctx0, model.layers[il_stored].ffn_gate_shexp, cur);
+                // ADP8 for shared expert gate_up input
+                ggml_tensor * shexp_input = cur;
+                if (model.layers[il_stored].ffn_shexp_gate_up_act_scale) {
+                    shexp_input = ggml_mul(ctx0, cur, model.layers[il_stored].ffn_shexp_gate_up_act_scale);
+                    if (model.layers[il_stored].ffn_shexp_gate_up_act_bias) {
+                        shexp_input = ggml_add(ctx0, shexp_input, model.layers[il_stored].ffn_shexp_gate_up_act_bias);
+                    }
+                }
+
+                ggml_tensor * up_shexp   = ggml_mul_mat(ctx0, model.layers[il_stored].ffn_up_shexp,   shexp_input);
+                ggml_tensor * gate_shexp = ggml_mul_mat(ctx0, model.layers[il_stored].ffn_gate_shexp, shexp_input);
 
                 ggml_tensor * ffn_shexp;
                 if (shexp_limit > 1e-6f) {
@@ -367,6 +453,14 @@ llama_model_bitnet::graph::graph(const llama_model & model, const llm_graph_para
                     ffn_shexp  = ggml_mul(ctx0, gate_shexp, up_shexp);
                 } else {
                     ffn_shexp = ggml_swiglu_split(ctx0, gate_shexp, up_shexp);
+                }
+
+                // ADP8 for shared expert down input
+                if (model.layers[il_stored].ffn_shexp_down_act_scale) {
+                    ffn_shexp = ggml_mul(ctx0, ffn_shexp, model.layers[il_stored].ffn_shexp_down_act_scale);
+                    if (model.layers[il_stored].ffn_shexp_down_act_bias) {
+                        ffn_shexp = ggml_add(ctx0, ffn_shexp, model.layers[il_stored].ffn_shexp_down_act_bias);
+                    }
                 }
 
                 ffn_shexp = ggml_mul_mat(ctx0, model.layers[il_stored].ffn_down_shexp, ffn_shexp);

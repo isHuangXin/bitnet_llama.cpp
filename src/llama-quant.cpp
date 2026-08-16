@@ -339,6 +339,10 @@ static bool tensor_allows_quantization(const llama_model_quantize_params * param
     quantize &= name.find("time_mix_decay_w2.weight") == std::string::npos;
     quantize &= name.find("time_mix_lerp_fused.weight") == std::string::npos;
 
+    // do not quantize ADP8 activation scale/bias tensors (BitNet MoE)
+    quantize &= name.find("act_scale") == std::string::npos;
+    quantize &= name.find("act_bias")  == std::string::npos;
+
     // do not quantize relative position bias (T5)
     quantize &= name.find("attn_rel_b.weight") == std::string::npos;
 

@@ -7,14 +7,9 @@ void llama_model_bitnet::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_YOCO_U_ITERS, hparams.yoco_u_iters, false);
 
     // Read sliding window for YOCO self-decoder layers
-    // YOCO uses sliding window attention (window_size=512) for self-decoder layers
-    // Cross-decoder layers use shared KV (no_cache mode) - SWA doesn't apply to them
+    // YOCO implements window attention via attention mask, not cache-level SWA.
+    // n_swa is stored as metadata but swa_type stays NONE (no cache truncation).
     ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW, hparams.n_swa, false);
-    if (hparams.n_swa > 0) {
-        hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
-        // Mark all layers as SWA (cross-decoder uses no_cache so mask is irrelevant)
-        hparams.set_swa_pattern(0);
-    }
 
     // MoE: read expert FFN dimension from custom key
     {

@@ -1314,8 +1314,16 @@ size_t ggml_nbytes(const struct ggml_tensor * tensor) {
             nbytes += (tensor->ne[i] - 1)*tensor->nb[i];
         }
         // BitNet I2_S/TL1/TL2: special nbytes for packed weight data
-        if (tensor->type == GGML_TYPE_I2_S || tensor->type == GGML_TYPE_TL1) {
-            // I2_S packs 4 elements per byte + 32 bytes header per 2D slice (expert)
+        if (tensor->type == GGML_TYPE_I2_S) {
+            // I2_S packs 4 elements per byte + per-row scales (M floats, padded to 32 bytes)
+            const int64_t n_per_row = tensor->ne[0];
+            const int64_t nrows = tensor->ne[1];
+            const int64_t n_slices = tensor->ne[2] * tensor->ne[3];
+            int64_t slice_bytes = (int64_t)nrows * n_per_row / 4 + nrows * (int64_t)sizeof(float);
+            if (slice_bytes % 32 != 0) slice_bytes = slice_bytes + (32 - slice_bytes % 32);
+            nbytes = (size_t)slice_bytes * n_slices;
+        } else if (tensor->type == GGML_TYPE_TL1) {
+            // TL1 packs 4 elements per byte + 32 bytes header
             const int64_t n_per_row = tensor->ne[0];
             const int64_t nrows = tensor->ne[1];
             const int64_t n_slices = tensor->ne[2] * tensor->ne[3];

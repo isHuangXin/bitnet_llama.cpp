@@ -77,6 +77,29 @@ void llama_model_bitnet::load_arch_tensors(llama_model_loader &) {
     const int64_t n_ff_exp      = hparams.n_ff_exp > 0 ? hparams.n_ff_exp : n_ff;
     const bool    has_moe       = (n_expert > 0);
 
+    // YOCO-U: only load physical (stored) layers from GGUF.
+    // With yoco_u_iters=T, n_layer_all was expanded to T*n_self + n_cross,
+    // but the GGUF only contains n_stored = n_self + n_cross unique layers.
+    const uint32_t T = hparams.yoco_u_iters;
+    int n_stored_layers = n_layer;  // default: all layers are stored
+    if (T > 1) {
+        // n_layer (expanded) = T * n_self + n_cross
+        // n_stored = n_self + n_cross = (n_layer + (T-1)*n_cross) / T ... solve:
+        // Actually: n_self = (n_layer - n_cross) / T, n_stored = n_self + n_cross
+        // From the expansion: n_cross = n_stored - n_self, n_layer = T*n_self + n_cross
+        // => n_stored = n_layer / T + n_cross * (T-1) / T ... simpler: use layers.size()
+        // layers was resized to n_layer_all (expanded), but GGUF has block_count tensors.
+        // The original block_count = n_stored = n_layer_all / T + cross*(T-1)/T
+        // Simplest: n_self = n_stored/2, n_cross = n_stored/2, n_layer = T*n_self + n_cross
+        // => n_stored = (n_layer + n_cross*(T-1)) hmm... let's just compute directly:
+        // n_layer = T * n_self + n_cross, n_stored = n_self + n_cross
+        // => n_self = (n_layer - n_cross) / T, and n_stored = n_self + n_cross
+        // We know n_self = n_cross (by design: half self, half cross)
+        // => n_layer = T * n_self + n_self = (T+1) * n_self => n_self = n_layer / (T+1)
+        // => n_stored = 2 * n_self = 2 * n_layer / (T+1)
+        n_stored_layers = 2 * n_layer / (T + 1);
+    }
+
     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
 
     // output
@@ -88,7 +111,7 @@ void llama_model_bitnet::load_arch_tensors(llama_model_loader &) {
     emb_in_norm  = create_tensor(tn(LLM_TENSOR_EMB_IN_NORM,  "weight"), {n_embd}, TENSOR_NOT_REQUIRED);
     emb_out_norm = create_tensor(tn(LLM_TENSOR_EMB_OUT_NORM, "weight"), {n_embd}, TENSOR_NOT_REQUIRED);
 
-    for (int i = 0; i < n_layer; ++i) {
+    for (int i = 0; i < n_stored_layers; ++i) {
         auto & layer = layers[i];
 
         const int64_t n_head_i    = hparams.n_head(i);

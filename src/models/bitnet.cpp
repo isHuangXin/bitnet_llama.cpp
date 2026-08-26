@@ -178,6 +178,12 @@ void llama_model_bitnet::load_arch_tensors(llama_model_loader &) {
             layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd, n_ff}, 0);
             layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {n_ff, n_embd}, 0);
             layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd, n_ff}, 0);
+
+            // ADP8 for dense FFN
+            layer.ffn_gate_up_act_scale = create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_ACT_SCALE, "weight", i), {n_embd}, TENSOR_NOT_REQUIRED);
+            layer.ffn_gate_up_act_bias  = create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_ACT_BIAS,  "weight", i), {n_embd}, TENSOR_NOT_REQUIRED);
+            layer.ffn_down_act_scale    = create_tensor(tn(LLM_TENSOR_FFN_DOWN_ACT_SCALE,    "weight", i), {n_ff}, TENSOR_NOT_REQUIRED);
+            layer.ffn_down_act_bias     = create_tensor(tn(LLM_TENSOR_FFN_DOWN_ACT_BIAS,     "weight", i), {n_ff}, TENSOR_NOT_REQUIRED);
         }
     }
 
@@ -495,11 +501,40 @@ llama_model_bitnet::graph::graph(const llama_model & model, const llm_graph_para
             }
             cb(cur, "ffn_out", il);
         } else {
-            cur = build_ffn(cur,
-                    model.layers[il_stored].ffn_up,   NULL, NULL,
-                    model.layers[il_stored].ffn_gate, NULL, NULL,
-                    model.layers[il_stored].ffn_down, NULL, NULL,
-                    NULL, LLM_FFN_SILU, LLM_FFN_PAR, il);
+            // Dense FFN — manual SwiGLU with ADP8 activation quantization
+            // (mirrors shared-expert path: clamp-before-silu + x*scale+bias hooks)
+            const float ffn_limit = hparams.swiglu_clamp_exp[il];
+
+            // ADP8 for gate/up input
+            ggml_tensor * ffn_input = cur;
+            if (model.layers[il_stored].ffn_gate_up_act_scale) {
+                ffn_input = ggml_mul(ctx0, cur, model.layers[il_stored].ffn_gate_up_act_scale);
+                if (model.layers[il_stored].ffn_gate_up_act_bias) {
+                    ffn_input = ggml_add(ctx0, ffn_input, model.layers[il_stored].ffn_gate_up_act_bias);
+                }
+            }
+
+            ggml_tensor * up_ffn   = ggml_mul_mat(ctx0, model.layers[il_stored].ffn_up,   ffn_input);
+            ggml_tensor * gate_ffn = ggml_mul_mat(ctx0, model.layers[il_stored].ffn_gate, ffn_input);
+
+            if (ffn_limit > 1e-6f) {
+                up_ffn   = ggml_clamp(ctx0, up_ffn,   -ffn_limit, ffn_limit);
+                gate_ffn = ggml_clamp(ctx0, gate_ffn, -INFINITY,  ffn_limit);
+                gate_ffn = ggml_silu(ctx0, gate_ffn);
+                cur = ggml_mul(ctx0, gate_ffn, up_ffn);
+            } else {
+                cur = ggml_swiglu_split(ctx0, gate_ffn, up_ffn);
+            }
+
+            // ADP8 for down input
+            if (model.layers[il_stored].ffn_down_act_scale) {
+                cur = ggml_mul(ctx0, cur, model.layers[il_stored].ffn_down_act_scale);
+                if (model.layers[il_stored].ffn_down_act_bias) {
+                    cur = ggml_add(ctx0, cur, model.layers[il_stored].ffn_down_act_bias);
+                }
+            }
+
+            cur = ggml_mul_mat(ctx0, model.layers[il_stored].ffn_down, cur);
             cb(cur, "ffn_out", il);
         }
 

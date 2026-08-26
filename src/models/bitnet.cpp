@@ -29,10 +29,20 @@ void llama_model_bitnet::load_arch_hparams(llama_model_loader & ml) {
 
     switch (hparams.n_layer()) {
         case 20:
-            if (hparams.yoco_u_iters > 1) {
-                type = LLM_TYPE_30B_A6B;  // YOCO-U-MoE: 20 stored layers, T=3 loop
+            if (hparams.n_expert > 0) {
+                // MoE models
+                if (hparams.yoco_u_iters > 1) {
+                    type = LLM_TYPE_30B_A6B;  // YOCO-U-MoE: 20 stored layers, T=3 loop
+                } else {
+                    type = LLM_TYPE_30B_A3B;  // YOCO-MoE: 20 layers
+                }
             } else {
-                type = LLM_TYPE_30B_A3B;  // YOCO-MoE: 20 layers
+                // Dense models
+                if (hparams.yoco_u_iters > 1) {
+                    type = LLM_TYPE_6B;  // YOCO-U-Dense: 20 stored layers, T=3 loop, ~6B effective
+                } else {
+                    type = LLM_TYPE_3B;  // YOCO-Dense: 20 layers, ~3B
+                }
             }
             break;
         case 26: type = LLM_TYPE_3B; break;

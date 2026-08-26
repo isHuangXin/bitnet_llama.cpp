@@ -122,6 +122,8 @@ enum llm_type {
     LLM_TYPE_21B_A3B, // Ernie MoE small
     LLM_TYPE_24B_A2B, // lfm2moe
     LLM_TYPE_26B_A4B, // Gemma4
+    LLM_TYPE_YOCO_3B,        // YOCO-Dense: 20 layers, ~3B
+    LLM_TYPE_YOCO_U_6B,     // YOCO-U-Dense: 20 stored layers, T=3 loop, ~6B effective
     LLM_TYPE_30B_A3B,
     LLM_TYPE_30B_A6B, // YOCO-U-MoE (universal loop, higher active params)
     LLM_TYPE_31B_A3_5B,

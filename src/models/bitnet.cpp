@@ -39,9 +39,9 @@ void llama_model_bitnet::load_arch_hparams(llama_model_loader & ml) {
             } else {
                 // Dense models
                 if (hparams.yoco_u_iters > 1) {
-                    type = LLM_TYPE_6B;  // YOCO-U-Dense: 20 stored layers, T=3 loop, ~6B effective
+                    type = LLM_TYPE_YOCO_U_6B;  // YOCO-U-Dense: 20 stored layers, T=3 loop, ~6B effective
                 } else {
-                    type = LLM_TYPE_3B;  // YOCO-Dense: 20 layers, ~3B
+                    type = LLM_TYPE_YOCO_3B;  // YOCO-Dense: 20 layers, ~3B
                 }
             }
             break;

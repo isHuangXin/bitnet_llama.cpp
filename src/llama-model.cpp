@@ -793,6 +793,8 @@ const char * llm_type_name(llm_type type) {
         case LLM_TYPE_21B_A3B:       return "21B.A3B";
         case LLM_TYPE_24B_A2B:       return "24B.A2B";
         case LLM_TYPE_26B_A4B:       return "26B.A4B";
+        case LLM_TYPE_YOCO_3B:       return "YOCO-3B";
+        case LLM_TYPE_YOCO_U_6B:     return "YOCO-U-6B";
         case LLM_TYPE_30B_A3B:       return "30B.A3B";
         case LLM_TYPE_30B_A6B:       return "30B.A6B";
         case LLM_TYPE_31B_A3_5B:     return "31B.A3.5B";
